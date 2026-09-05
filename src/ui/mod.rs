@@ -2,8 +2,11 @@
 
 mod colors;
 mod note_window;
+mod reminder_dialog;
+mod search_window;
 
-pub use note_window::NoteWindow;
+pub use note_window::{NoteCallbacks, NoteWindow};
+pub use search_window::SearchWindow;
 
 use std::cell::RefCell;
 

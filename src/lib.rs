@@ -10,6 +10,9 @@
 pub mod app;
 pub mod cli;
 pub mod error;
+pub mod messages;
+pub mod search;
 pub mod settings;
 pub mod storage;
+pub mod tray;
 pub mod ui;

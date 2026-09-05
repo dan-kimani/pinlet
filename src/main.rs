@@ -20,10 +20,10 @@ fn main() -> glib::ExitCode {
         .application_id("org.pinlet.Pinlet")
         .build();
 
-    gtk_app.connect_activate(move |gtk_app| match app::App::new() {
+    gtk_app.connect_activate(move |gtk_app| match app::App::new(gtk_app) {
         Ok(app) => {
             ui::ensure_styles();
-            app.activate(gtk_app, &cli);
+            app.activate(&cli);
         }
         Err(err) => {
             eprintln!("failed to start Pinlet: {err}");

@@ -3,18 +3,40 @@
 use std::rc::Rc;
 
 use adw::prelude::*;
+use chrono::{DateTime, Local, Utc};
 use gtk4::{
-    Button, FlowBox, HeaderBar, MenuButton, Orientation, Popover, ScrolledWindow, TextView,
+    Button, FlowBox, HeaderBar, Label, ListBox, ListBoxRow, MenuButton, Orientation, Popover,
+    ScrolledWindow, TextView,
 };
 
 use crate::app::SharedNote;
-use crate::storage::NoteColor;
+use crate::storage::{NoteColor, Recurrence, Reminder, WindowGeometry};
 use crate::ui::colors;
+use crate::ui::reminder_dialog;
 
 /// Stylesheet shared by every note window.
 pub const STYLE: &str = include_str!("style.css");
 
+/// Callbacks from a note window into the app core.
+pub struct NoteCallbacks {
+    /// The body text changed (triggers debounced save).
+    pub on_changed: Box<dyn Fn(String)>,
+    /// The user confirmed deletion.
+    pub on_delete: Box<dyn Fn()>,
+    /// The user asked for another note.
+    pub on_new: Box<dyn Fn()>,
+    /// The window is closing (flush pending state).
+    pub on_close: Box<dyn Fn()>,
+    /// The user picked a due time for a new reminder.
+    pub on_add_reminder: Box<dyn Fn(DateTime<Utc>)>,
+    /// The user removed reminder `index`.
+    pub on_delete_reminder: Box<dyn Fn(usize)>,
+    /// The window was resized or moved (debounced geometry save).
+    pub on_geometry_changed: Box<dyn Fn()>,
+}
+
 /// One window per note, styled like a sheet of paper.
+#[derive(Clone)]
 pub struct NoteWindow {
     window: gtk4::ApplicationWindow,
     /// Kept alive so a custom hex color stays applied.
@@ -23,26 +45,20 @@ pub struct NoteWindow {
 
 impl NoteWindow {
     /// Build a note window and wire it to the app-core callbacks.
-    ///
-    /// * `on_changed` — the body text changed (triggers debounced save).
-    /// * `on_delete` — the user confirmed deletion.
-    /// * `on_new` — the user asked for another note.
-    /// * `on_close` — the window is closing (flush pending state).
     pub fn new(
         app: &gtk4::Application,
         shared: Rc<SharedNote>,
-        on_changed: impl Fn(String) + 'static,
-        on_delete: impl Fn() + 'static,
-        on_new: impl Fn() + 'static,
-        on_close: impl Fn() + 'static,
+        geometry: Option<WindowGeometry>,
+        callbacks: NoteCallbacks,
     ) -> Self {
+        let callbacks = Rc::new(callbacks);
         let color = shared.note.borrow().color.clone();
 
         let window = gtk4::ApplicationWindow::builder()
             .application(app)
             .title(shared.display_title())
-            .default_width(300)
-            .default_height(320)
+            .default_width(geometry.map_or(300, |g| g.width))
+            .default_height(geometry.map_or(320, |g| g.height))
             .build();
         window.set_css_classes(&[color.css_class()]);
 
@@ -52,8 +68,10 @@ impl NoteWindow {
 
         let new_btn = Button::from_icon_name("list-add-symbolic");
         new_btn.set_tooltip_text(Some("New note"));
-        let on_new = Rc::new(on_new);
-        new_btn.connect_clicked(move |_| (on_new)());
+        {
+            let callbacks = callbacks.clone();
+            new_btn.connect_clicked(move |_| (callbacks.on_new)());
+        }
 
         // Inline color palette: a popover of swatches.
         let popover = Popover::new();
@@ -61,7 +79,6 @@ impl NoteWindow {
             .max_children_per_line(3)
             .selection_mode(gtk4::SelectionMode::None)
             .build();
-        let on_changed = Rc::new(on_changed);
         for swatch_color in NoteColor::PALETTE {
             let swatch = Button::builder()
                 .width_request(32)
@@ -71,12 +88,12 @@ impl NoteWindow {
             swatch.add_css_class(swatch_color.css_class());
             let shared = shared.clone();
             let window = window.clone();
-            let on_changed = on_changed.clone();
+            let callbacks = callbacks.clone();
             swatch.connect_clicked(move |_| {
                 shared.note.borrow_mut().color = swatch_color.clone();
                 window.set_css_classes(&[swatch_color.css_class()]);
                 let body = shared.body.borrow();
-                (on_changed)(body.clone());
+                (callbacks.on_changed)(body.clone());
             });
             palette.insert(&swatch, -1);
         }
@@ -87,12 +104,33 @@ impl NoteWindow {
             .tooltip_text("Note color")
             .build();
 
+        // Reminder popover: rebuilt on every show so it always
+        // reflects the note's current reminders.
+        let reminders_popover = Popover::new();
+        {
+            let shared = shared.clone();
+            let callbacks = callbacks.clone();
+            let window = window.clone();
+            reminders_popover.connect_show(move |popover| {
+                popover.set_child(Some(&build_reminders_popover(
+                    &shared,
+                    &callbacks,
+                    &window,
+                )));
+            });
+        }
+        let reminder_btn = MenuButton::builder()
+            .icon_name("alarm-symbolic")
+            .popover(&reminders_popover)
+            .tooltip_text("Reminders")
+            .build();
+
         // Delete, with confirmation.
         let delete_btn = Button::from_icon_name("user-trash-symbolic");
         delete_btn.set_tooltip_text(Some("Delete note"));
         {
             let window = window.clone();
-            let on_delete = Rc::new(on_delete);
+            let callbacks = callbacks.clone();
             delete_btn.connect_clicked(move |_| {
                 let dialog = adw::MessageDialog::builder()
                     .heading("Delete note?")
@@ -102,13 +140,11 @@ impl NoteWindow {
                 dialog.add_response("delete", "Delete");
                 dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
                 dialog.set_default_response(Some("cancel"));
-                let window = window.clone();
-                let on_delete = on_delete.clone();
                 dialog.set_transient_for(Some(&window));
+                let callbacks = callbacks.clone();
                 dialog.connect_response(None, move |dialog, response| {
                     if response == "delete" {
-                        (on_delete)();
-                        window.close();
+                        (callbacks.on_delete)();
                     }
                     dialog.close();
                 });
@@ -116,9 +152,8 @@ impl NoteWindow {
             });
         }
 
-        // Phase 2/3 placeholders: reminders, locking, pinning.
+        // Phase 2/3 placeholders: locking, pinning.
         for (icon, tooltip) in [
-            ("alarm-symbolic", "Reminders — coming soon"),
             ("system-lock-screen-symbolic", "Lock — coming soon"),
             ("view-pin-symbolic", "Pin to desktop — coming soon"),
         ] {
@@ -128,6 +163,7 @@ impl NoteWindow {
             header.pack_end(&stub);
         }
         header.pack_end(&delete_btn);
+        header.pack_end(&reminder_btn);
         header.pack_start(&color_btn);
         header.pack_start(&new_btn);
 
@@ -142,13 +178,16 @@ impl NoteWindow {
         text_view.add_css_class("pinlet-body");
         text_view.buffer().set_text(&shared.body.borrow());
 
-        let buffer = text_view.buffer();
-        buffer.connect_changed(move |buffer| {
-            let text = buffer
-                .text(&buffer.start_iter(), &buffer.end_iter(), false)
-                .to_string();
-            (on_changed)(text);
-        });
+        {
+            let callbacks = callbacks.clone();
+            let buffer = text_view.buffer();
+            buffer.connect_changed(move |buffer| {
+                let text = buffer
+                    .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                    .to_string();
+                (callbacks.on_changed)(text);
+            });
+        }
 
         let scroller = ScrolledWindow::builder()
             .child(&text_view)
@@ -179,12 +218,24 @@ impl NoteWindow {
             _ => None,
         };
 
+        // Geometry: notify the app core (debounced there) whenever
+        // the window is resized.
+        {
+            let callbacks = callbacks.clone();
+            let width = callbacks.clone();
+            let height = callbacks.clone();
+            window.connect_notify_local(Some("width"), move |_, _| (width.on_geometry_changed)());
+            window.connect_notify_local(Some("height"), move |_, _| (height.on_geometry_changed)());
+        }
+
         // Flush pending state when the window closes.
-        let on_close = Rc::new(on_close);
-        window.connect_close_request(move |_| {
-            (on_close)();
-            gtk4::glib::Propagation::Proceed
-        });
+        {
+            let callbacks = callbacks.clone();
+            window.connect_close_request(move |_| {
+                (callbacks.on_close)();
+                gtk4::glib::Propagation::Proceed
+            });
+        }
 
         Self {
             window,
@@ -195,5 +246,102 @@ impl NoteWindow {
     /// Show and focus the window.
     pub fn present(&self) {
         self.window.present();
+    }
+
+    /// Whether the window is currently visible.
+    pub fn is_visible(&self) -> bool {
+        self.window.is_visible()
+    }
+
+    /// Show or hide the window (tray "show / hide all").
+    pub fn set_visible(&self, visible: bool) {
+        self.window.set_visible(visible);
+    }
+
+    /// Close the window.
+    pub fn close(&self) {
+        self.window.close();
+    }
+
+    /// Current width in logical pixels.
+    pub fn width(&self) -> i32 {
+        self.window.width()
+    }
+
+    /// Current height in logical pixels.
+    pub fn height(&self) -> i32 {
+        self.window.height()
+    }
+
+    /// Screen position of the surface origin, where the compositor
+    /// reports one (X11; on Wayland this is (0, 0)).
+    pub fn position_on_screen(&self) -> (f64, f64) {
+        self.window.surface_transform()
+    }
+}
+
+/// Build the reminder popover content fresh (called on every show).
+fn build_reminders_popover(
+    shared: &Rc<SharedNote>,
+    callbacks: &Rc<NoteCallbacks>,
+    window: &gtk4::ApplicationWindow,
+) -> gtk4::Box {
+    let content = gtk4::Box::new(Orientation::Vertical, 4);
+
+    let list = ListBox::builder()
+        .selection_mode(gtk4::SelectionMode::None)
+        .build();
+    for (index, reminder) in shared.note.borrow().reminders.iter().enumerate() {
+        let row = ListBoxRow::new();
+        let row_box = gtk4::Box::new(Orientation::Horizontal, 8);
+        let label = Label::builder()
+            .label(format_reminder(reminder))
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
+        let delete = Button::from_icon_name("user-trash-symbolic");
+        delete.set_tooltip_text(Some("Delete reminder"));
+        {
+            let callbacks = callbacks.clone();
+            delete.connect_clicked(move |_| (callbacks.on_delete_reminder)(index));
+        }
+        row_box.append(&label);
+        row_box.append(&delete);
+        row.set_child(Some(&row_box));
+        list.append(&row);
+    }
+    content.append(&list);
+
+    if list.first_child().is_none() {
+        let empty = Label::builder()
+            .label("No reminders yet")
+            .xalign(0.0)
+            .build();
+        empty.add_css_class("dim-label");
+        content.append(&empty);
+    }
+
+    let add = Button::builder().label("Add reminder…").build();
+    {
+        let callbacks = callbacks.clone();
+        let window = window.clone();
+        add.connect_clicked(move |_| {
+            let callbacks = callbacks.clone();
+            reminder_dialog::present(&window, move |due| (callbacks.on_add_reminder)(due));
+        });
+    }
+    content.append(&add);
+    content
+}
+
+/// Human-readable reminder label: local due time plus recurrence.
+fn format_reminder(reminder: &Reminder) -> String {
+    let when = reminder.due_at.with_timezone(&Local).format("%b %e, %H:%M");
+    match reminder.recurrence_rule {
+        Recurrence::None => format!("{when}"),
+        Recurrence::Daily => format!("{when} · daily"),
+        Recurrence::Weekly => format!("{when} · weekly"),
+        Recurrence::Weekdays => format!("{when} · weekdays"),
+        Recurrence::Custom(n) => format!("{when} · every {n} d"),
     }
 }
