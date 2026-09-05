@@ -1,0 +1,42 @@
+/* Embedded stylesheet for note windows (see note_window.rs).
+ * Every selector is scoped with a `pinlet-*` class so nothing leaks
+ * to other applications on the same display. */
+
+.pinlet-yellow {
+  background-color: #fbf3b0;
+}
+
+.pinlet-green {
+  background-color: #c9efc2;
+}
+
+.pinlet-blue {
+  background-color: #b9dcf6;
+}
+
+.pinlet-pink {
+  background-color: #f6c9dd;
+}
+
+.pinlet-purple {
+  background-color: #dac9f6;
+}
+
+.pinlet-charcoal {
+  background-color: #3c3f42;
+}
+
+headerbar.pinlet-header {
+  background: transparent;
+  box-shadow: none;
+}
+
+textview.pinlet-body,
+textview.pinlet-body text {
+  background: transparent;
+  font-size: 14pt;
+}
+
+window.pinlet-charcoal textview.pinlet-body text {
+  color: #ececec;
+}
