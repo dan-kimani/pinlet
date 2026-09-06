@@ -57,8 +57,14 @@ See [`flatpak/README.md`](flatpak/README.md).
 ### Debian package
 
 ```bash
+cargo install cargo-deb
 cargo deb
 ```
+
+The package installs the `pinlet` binary, a launcher entry (so Pinlet is
+searchable from the application menu), the app icon, and metadata. Its
+post-install script pre-creates `~/.local/share/pinlet` and `git init`s it for
+the installing user; the app also does this on first launch.
 
 ## Usage
 

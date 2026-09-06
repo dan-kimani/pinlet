@@ -1,0 +1,25 @@
+#!/bin/sh
+# Pinlet: pre-create the per-user notes repository for the installing user.
+#
+# Notes live in ~/.local/share/pinlet (a git repository). This runs at
+# package install time, so the first launch finds a ready directory and
+# repo. Best-effort: the app recreates both on first run, so failures here
+# are never fatal.
+set -e
+
+user="${SUDO_USER:-}"
+# Only meaningful when installing for a real user (e.g. `sudo dpkg -i`).
+[ -n "$user" ] && [ "$user" != "root" ] || exit 0
+
+home=$(getent passwd "$user" | cut -d: -f6)
+[ -n "$home" ] || exit 0
+
+dir="$home/.local/share/pinlet"
+mkdir -p "$dir"
+chown "$user:" "$dir"
+
+if [ ! -d "$dir/.git" ]; then
+    runuser -u "$user" -- git -C "$dir" init --quiet 2>/dev/null || true
+fi
+
+exit 0

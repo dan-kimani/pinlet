@@ -22,10 +22,12 @@ impl GitRepo {
     pub fn open_or_init(dir: PathBuf) -> AppResult<Self> {
         if !dir.join(".git").exists() {
             run_git(Some(&dir), &["init", "--quiet"])?;
-            // Identity is scoped to this repository only.
-            run_git(Some(&dir), &["config", "user.name", "Pinlet"])?;
-            run_git(Some(&dir), &["config", "user.email", "pinlet@localhost"])?;
         }
+        // Identity is scoped to this repository only. Set it on every start so
+        // a repo initialized elsewhere (e.g. by the installer's postinst) still
+        // has a committer identity for auto-commits.
+        run_git(Some(&dir), &["config", "user.name", "Pinlet"])?;
+        run_git(Some(&dir), &["config", "user.email", "pinlet@localhost"])?;
         let repo = Self { dir };
         repo.write_gitignore()?;
         Ok(repo)

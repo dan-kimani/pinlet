@@ -36,6 +36,7 @@ copyright = "2026, Daniel Kimani"
 depends = "libgtk-4-1 (>= 4.10), libadwaita-1-0 (>= 1.4), git"
 section = "utility"
 priority = "optional"
+maintainer-scripts = "debian/"
 assets = [
     ["target/release/pinlet", "usr/bin/pinlet", "755"],
     ["assets/org.pinlet.Pinlet.desktop", "usr/share/applications/org.pinlet.Pinlet.desktop", "644"],
