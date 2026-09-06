@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Pinlet
+Comment=Sticky notes for your desktop
+Exec=pinlet
+Icon=org.pinlet.Pinlet
+Terminal=false
+Type=Application
+Categories=Utility;
+Keywords=notes;sticky;reminders;pinlet;

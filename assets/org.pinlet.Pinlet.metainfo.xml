@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.pinlet.Pinlet</id>
+  <name>Pinlet</name>
+  <summary>Sticky notes for your desktop</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <description>
+    <p>
+      Pinlet keeps colorful sticky notes on your Linux desktop. Notes are
+      plain Markdown files inside a git repository you own — with reminders,
+      checklists, desktop pinning, and git-based cross-machine syncing.
+    </p>
+  </description>
+  <launchable type="desktop-id">org.pinlet.Pinlet.desktop</launchable>
+  <provides>
+    <binary>pinlet</binary>
+  </provides>
+  <categories>
+    <category>Utility</category>
+  </categories>
+</component>
