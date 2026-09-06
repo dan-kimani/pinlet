@@ -29,4 +29,10 @@ pub enum Msg {
     OpenSettings,
     /// Quit the application.
     Quit,
+    /// Pull the note repo from its git remote.
+    GitPull,
+    /// Push the note repo to its git remote.
+    GitPush,
+    /// Result of the last git push/pull, shown in preferences.
+    GitResult(String),
 }

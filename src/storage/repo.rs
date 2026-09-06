@@ -43,6 +43,36 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Point `origin` at `url` and rename the current branch to `branch`.
+    /// A no-op when `url` is empty. Idempotent, so it can run before every
+    /// push/pull.
+    pub fn configure_sync(&self, url: &str, branch: &str) -> AppResult<()> {
+        if url.is_empty() {
+            return Ok(());
+        }
+        let remotes = run_git_capture(Some(&self.dir), &["remote"])?;
+        if remotes.lines().any(|line| line.trim() == "origin") {
+            run_git(Some(&self.dir), &["remote", "set-url", "origin", url])?;
+        } else {
+            run_git(Some(&self.dir), &["remote", "add", "origin", url])?;
+        }
+        // Rename the current branch to the configured one. This fails on a
+        // fresh repo with no commits yet, which is fine — the branch will be
+        // created on the first commit.
+        let _ = run_git(Some(&self.dir), &["branch", "-M", branch]);
+        Ok(())
+    }
+
+    /// Pull fast-forward-only changes from `origin`.
+    pub fn pull(&self, branch: &str) -> AppResult<()> {
+        run_git(Some(&self.dir), &["pull", "--ff-only", "origin", branch])
+    }
+
+    /// Push to `origin` and set the upstream branch.
+    pub fn push(&self, branch: &str) -> AppResult<()> {
+        run_git(Some(&self.dir), &["push", "-u", "origin", branch])
+    }
+
     /// Keep machine-specific and sensitive files out of version
     /// control, merging new entries into an existing `.gitignore`.
     fn write_gitignore(&self) -> AppResult<()> {

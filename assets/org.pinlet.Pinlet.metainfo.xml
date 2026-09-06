@@ -4,7 +4,7 @@
   <name>Pinlet</name>
   <summary>Sticky notes for your desktop</summary>
   <metadata_license>CC0-1.0</metadata_license>
-  <project_license>GPL-3.0-or-later</project_license>
+  <project_license>MIT</project_license>
   <description>
     <p>
       Pinlet keeps colorful sticky notes on your Linux desktop. Notes are

@@ -371,10 +371,56 @@ impl App {
             Msg::Search => self.open_search(),
             Msg::Snooze { note, due, minutes } => self.snooze_reminder(note, due, minutes),
             Msg::OpenSettings => self.open_settings(),
+            Msg::GitPull => self.git_pull(),
+            Msg::GitPush => self.git_push(),
+            Msg::GitResult(message) => self.set_git_status(&message),
             Msg::Quit => {
                 self.flush_all();
                 self.inner.gtk_app.quit();
             }
+        }
+    }
+
+    /// Pull the note repo from its configured remote, off the main loop.
+    fn git_pull(&self) {
+        let repo = self.inner.repo.clone();
+        let branch = self.inner.settings.borrow().git_branch.clone();
+        let url = self.inner.settings.borrow().git_remote_url.clone();
+        let tx = self.inner.tx.clone();
+        std::thread::spawn(move || {
+            let result = repo
+                .configure_sync(&url, &branch)
+                .and_then(|_| repo.pull(&branch));
+            let message = match result {
+                Ok(()) => "Pulled".to_owned(),
+                Err(err) => format!("Pull failed: {err}"),
+            };
+            let _ = tx.send(Msg::GitResult(message));
+        });
+    }
+
+    /// Push the note repo to its configured remote, off the main loop.
+    fn git_push(&self) {
+        let repo = self.inner.repo.clone();
+        let branch = self.inner.settings.borrow().git_branch.clone();
+        let url = self.inner.settings.borrow().git_remote_url.clone();
+        let tx = self.inner.tx.clone();
+        std::thread::spawn(move || {
+            let result = repo
+                .configure_sync(&url, &branch)
+                .and_then(|_| repo.push(&branch));
+            let message = match result {
+                Ok(()) => "Pushed".to_owned(),
+                Err(err) => format!("Push failed: {err}"),
+            };
+            let _ = tx.send(Msg::GitResult(message));
+        });
+    }
+
+    /// Show the result of a git push/pull in the preferences window.
+    fn set_git_status(&self, message: &str) {
+        if let Some(window) = self.inner.settings_window.borrow().as_ref() {
+            window.set_git_status(message);
         }
     }
 
@@ -993,6 +1039,30 @@ impl App {
                         move |value| {
                             this.set_setting(|settings| settings.autostart = value);
                             this.set_autostart(value);
+                        }
+                    }),
+                    on_git_sync: Box::new({
+                        let this = self.clone();
+                        move |value| this.set_setting(|settings| settings.git_sync_enabled = value)
+                    }),
+                    on_git_remote: Box::new({
+                        let this = self.clone();
+                        move |value| this.set_setting(|settings| settings.git_remote_url = value)
+                    }),
+                    on_git_branch: Box::new({
+                        let this = self.clone();
+                        move |value| this.set_setting(|settings| settings.git_branch = value)
+                    }),
+                    on_git_pull: Box::new({
+                        let this = self.clone();
+                        move || {
+                            let _ = this.inner.tx.send(Msg::GitPull);
+                        }
+                    }),
+                    on_git_push: Box::new({
+                        let this = self.clone();
+                        move || {
+                            let _ = this.inner.tx.send(Msg::GitPush);
                         }
                     }),
                 },

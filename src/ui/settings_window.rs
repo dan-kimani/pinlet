@@ -5,7 +5,8 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use adw::{
-    ActionRow, ComboRow, PreferencesGroup, PreferencesPage, PreferencesWindow, SpinRow, SwitchRow,
+    ActionRow, ComboRow, EntryRow, PreferencesGroup, PreferencesPage, PreferencesWindow, SpinRow,
+    SwitchRow,
 };
 use gtk4::gio;
 use gtk4::{Adjustment, Label, Orientation, SignalListItemFactory};
@@ -27,6 +28,16 @@ pub struct SettingsCallbacks {
     pub on_enable_shortcut: Box<dyn Fn(bool)>,
     /// Start on login.
     pub on_autostart: Box<dyn Fn(bool)>,
+    /// Git sync enabled.
+    pub on_git_sync: Box<dyn Fn(bool)>,
+    /// Git remote URL changed.
+    pub on_git_remote: Box<dyn Fn(String)>,
+    /// Git branch changed.
+    pub on_git_branch: Box<dyn Fn(String)>,
+    /// Pull the note repo from its remote.
+    pub on_git_pull: Box<dyn Fn()>,
+    /// Push the note repo to its remote.
+    pub on_git_push: Box<dyn Fn()>,
 }
 
 /// The six palette colors, in palette order.
@@ -35,6 +46,8 @@ pub const COLOR_NAMES: [&str; 6] = ["Yellow", "Green", "Blue", "Pink", "Purple",
 /// One settings window per application; shown and hidden on demand.
 pub struct SettingsWindow {
     window: PreferencesWindow,
+    /// Status line under the git sync controls, updated after push/pull.
+    git_status: gtk4::Label,
 }
 
 impl SettingsWindow {
@@ -191,9 +204,115 @@ impl SettingsWindow {
         storage_group.add(&data_row);
         page.add(&storage_group);
 
+        let git_group = PreferencesGroup::builder().title("Git sync").build();
+        git_group.set_margin_top(18);
+
+        let sync_row = SwitchRow::builder()
+            .title("Sync with a remote")
+            .subtitle("Push and pull the note repository")
+            .active(settings.git_sync_enabled)
+            .build();
+        pad_row(&sync_row);
+        git_group.add(&sync_row);
+
+        let remote_row = EntryRow::builder()
+            .title("Remote URL")
+            .text(settings.git_remote_url.as_str())
+            .build();
+        pad_row(&remote_row);
+        git_group.add(&remote_row);
+
+        let branch_row = EntryRow::builder()
+            .title("Branch")
+            .text(settings.git_branch.as_str())
+            .build();
+        pad_row(&branch_row);
+        git_group.add(&branch_row);
+
+        let pull_row = ActionRow::builder()
+            .title("Pull now")
+            .subtitle("Fetch and fast-forward from the remote")
+            .activatable(true)
+            .build();
+        pad_row(&pull_row);
+        git_group.add(&pull_row);
+
+        let push_row = ActionRow::builder()
+            .title("Push now")
+            .subtitle("Push committed changes to the remote")
+            .activatable(true)
+            .build();
+        pad_row(&push_row);
+        git_group.add(&push_row);
+
+        let git_status = Label::builder().xalign(0.0).wrap(true).build();
+        git_status.add_css_class("dim-label");
+        git_status.set_margin_start(16);
+        git_status.set_margin_end(16);
+        git_status.set_margin_top(4);
+        git_group.add(&git_status);
+
+        // The sync switch gates the remote, branch, and buttons.
+        let apply_sync_state = {
+            let remote_row = remote_row.clone();
+            let branch_row = branch_row.clone();
+            let pull_row = pull_row.clone();
+            let push_row = push_row.clone();
+            move |on: bool| {
+                remote_row.set_sensitive(on);
+                branch_row.set_sensitive(on);
+                pull_row.set_sensitive(on);
+                push_row.set_sensitive(on);
+            }
+        };
+        apply_sync_state(settings.git_sync_enabled);
+        {
+            let callbacks = callbacks.clone();
+            let apply_sync_state = apply_sync_state.clone();
+            sync_row.connect_active_notify(move |row| {
+                let on = row.is_active();
+                apply_sync_state(on);
+                (callbacks.on_git_sync)(on);
+            });
+        }
+        {
+            let callbacks = callbacks.clone();
+            remote_row.connect_apply(move |row| {
+                (callbacks.on_git_remote)(row.text().to_string());
+            });
+        }
+        {
+            let callbacks = callbacks.clone();
+            branch_row.connect_apply(move |row| {
+                (callbacks.on_git_branch)(row.text().to_string());
+            });
+        }
+        {
+            let callbacks = callbacks.clone();
+            pull_row.connect_activated(move |_| {
+                (callbacks.on_git_pull)();
+            });
+        }
+        {
+            let callbacks = callbacks.clone();
+            push_row.connect_activated(move |_| {
+                (callbacks.on_git_push)();
+            });
+        }
+
+        page.add(&git_group);
+
         window.add(&page);
 
-        Self { window }
+        Self {
+            window,
+            git_status,
+        }
+    }
+
+    /// Update the git status line after a push or pull.
+    pub fn set_git_status(&self, message: &str) {
+        self.git_status.set_label(message);
     }
 
     /// Show and focus the window.

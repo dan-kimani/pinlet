@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Pinlet — native sticky notes for Linux desktops"
+license = "MIT"
 
 [dependencies]
 argon2 = "0.6.0"
