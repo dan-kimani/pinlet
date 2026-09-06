@@ -1,15 +1,14 @@
-//! The preferences window (spec §3.5): appearance, behavior, data.
+//! The preferences window (spec §3.5): appearance, behavior, data, sync.
 
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use adw::prelude::*;
 use adw::{
-    ActionRow, ComboRow, EntryRow, PreferencesGroup, PreferencesPage, PreferencesWindow, SpinRow,
-    SwitchRow,
+    ActionRow, ComboRow, EntryRow, PreferencesGroup, PreferencesPage, PreferencesWindow, SwitchRow,
 };
 use gtk4::gio;
-use gtk4::{Adjustment, Label, Orientation, SignalListItemFactory};
+use gtk4::{CheckButton, Label, Orientation, PasswordEntry, SignalListItemFactory};
 
 use crate::settings::Settings;
 use crate::storage::NoteColor;
@@ -38,10 +37,18 @@ pub struct SettingsCallbacks {
     pub on_git_pull: Box<dyn Fn()>,
     /// Push the note repo to its remote.
     pub on_git_push: Box<dyn Fn()>,
+    /// Master password changed.
+    pub on_master_password: Box<dyn Fn(String)>,
 }
 
 /// The six palette colors, in palette order.
 pub const COLOR_NAMES: [&str; 6] = ["Yellow", "Green", "Blue", "Pink", "Purple", "Charcoal"];
+
+/// Auto-save debounce presets, in milliseconds.
+const SAVE_DELAYS_MS: [u64; 4] = [500, 1000, 2000, 5000];
+
+/// Human-readable labels for the auto-save presets, matching [`SAVE_DELAYS_MS`].
+const SAVE_DELAY_LABELS: [&str; 4] = ["0.5 s", "1 s", "2 s", "5 s"];
 
 /// One settings window per application; shown and hidden on demand.
 pub struct SettingsWindow {
@@ -58,6 +65,7 @@ impl SettingsWindow {
         app: &gtk4::Application,
         settings: &Settings,
         data_dir: PathBuf,
+        master_password: &str,
         shortcut_support: bool,
         shortcut_subtitle: &'static str,
         callbacks: SettingsCallbacks,
@@ -80,26 +88,51 @@ impl SettingsWindow {
         page.set_margin_start(12);
         page.set_margin_end(12);
 
-        let colors_group = PreferencesGroup::builder().title("Note colors").build();
+        let appearance_group = PreferencesGroup::builder().title("Appearance").build();
 
-        let force_row = SwitchRow::builder()
-            .title("Use one color for all notes")
-            .subtitle("Override every note's own color (spec Mode B)")
-            .active(settings.force_global_color)
+        // Note color mode: a radio pair (spec Mode A vs Mode B).
+        let per_note_cb = CheckButton::builder().build();
+        let uniform_cb = CheckButton::builder().build();
+        uniform_cb.set_group(Some(&per_note_cb));
+        per_note_cb.set_active(!settings.force_global_color);
+        uniform_cb.set_active(settings.force_global_color);
+
+        let per_note_row = ActionRow::builder()
+            .title("Per-note colors")
+            .subtitle("Each note keeps its own color")
+            .activatable_widget(&per_note_cb)
             .build();
-        pad_row(&force_row);
+        pad_row(&per_note_row);
         {
             let callbacks = callbacks.clone();
-            force_row.connect_active_notify(move |row| {
-                (callbacks.on_force_global_color)(row.is_active());
+            per_note_cb.connect_toggled(move |cb| {
+                if cb.is_active() {
+                    (callbacks.on_force_global_color)(false);
+                }
             });
         }
-        colors_group.add(&force_row);
+        appearance_group.add(&per_note_row);
+
+        let uniform_row = ActionRow::builder()
+            .title("Uniform color")
+            .subtitle("All notes share one color")
+            .activatable_widget(&uniform_cb)
+            .build();
+        pad_row(&uniform_row);
+        {
+            let callbacks = callbacks.clone();
+            uniform_cb.connect_toggled(move |cb| {
+                if cb.is_active() {
+                    (callbacks.on_force_global_color)(true);
+                }
+            });
+        }
+        appearance_group.add(&uniform_row);
 
         let color_names = gtk4::StringList::new(&COLOR_NAMES);
         let default_color_row = ComboRow::builder()
             .title("Default note color")
-            .subtitle("Used for newly created notes")
+            .subtitle("Used for new notes and for uniform mode")
             .model(&color_names)
             .selected(selected_index(&settings.default_color))
             .build();
@@ -113,11 +146,11 @@ impl SettingsWindow {
                 (callbacks.on_default_color)(name);
             });
         }
-        colors_group.add(&default_color_row);
+        appearance_group.add(&default_color_row);
 
         let dark_row = SwitchRow::builder()
             .title("Follow system dark mode")
-            .subtitle("Match GNOME's light/dark preference")
+            .subtitle("Match the desktop's light/dark preference")
             .active(settings.sync_dark_mode)
             .build();
         pad_row(&dark_row);
@@ -127,28 +160,22 @@ impl SettingsWindow {
                 (callbacks.on_sync_dark_mode)(row.is_active());
             });
         }
-        colors_group.add(&dark_row);
-        page.add(&colors_group);
+        appearance_group.add(&dark_row);
+        page.add(&appearance_group);
 
         let editing_group = PreferencesGroup::builder().title("Editing").build();
         editing_group.set_margin_top(18);
-        let save_row = SpinRow::builder()
+        let save_row = ComboRow::builder()
             .title("Auto-save delay")
-            .subtitle("Milliseconds after typing stops")
-            .adjustment(&Adjustment::new(
-                settings.auto_save_debounce_ms as f64,
-                100.0,
-                5000.0,
-                100.0,
-                500.0,
-                0.0,
-            ))
+            .subtitle("Time after typing stops before a note is saved")
+            .model(&gtk4::StringList::new(&SAVE_DELAY_LABELS))
+            .selected(save_delay_index(settings.auto_save_debounce_ms))
             .build();
         pad_row(&save_row);
         {
             let callbacks = callbacks.clone();
-            save_row.connect_value_notify(move |row| {
-                (callbacks.on_auto_save_debounce)(row.value() as u64);
+            save_row.connect_selected_notify(move |row| {
+                (callbacks.on_auto_save_debounce)(SAVE_DELAYS_MS[row.selected() as usize]);
             });
         }
         editing_group.add(&save_row);
@@ -204,7 +231,29 @@ impl SettingsWindow {
         storage_group.add(&data_row);
         page.add(&storage_group);
 
-        let git_group = PreferencesGroup::builder().title("Git sync").build();
+        let security_group = PreferencesGroup::builder().title("Security").build();
+        security_group.set_margin_top(18);
+        let password_row = ActionRow::builder()
+            .title("Master password")
+            .subtitle("Used to lock and unlock notes")
+            .build();
+        let password_entry = PasswordEntry::builder()
+            .show_peek_icon(true)
+            .hexpand(true)
+            .build();
+        password_entry.set_text(master_password);
+        password_row.add_suffix(&password_entry);
+        pad_row(&password_row);
+        {
+            let callbacks = callbacks.clone();
+            password_entry.connect_changed(move |entry| {
+                (callbacks.on_master_password)(entry.text().to_string());
+            });
+        }
+        security_group.add(&password_row);
+        page.add(&security_group);
+
+        let git_group = PreferencesGroup::builder().title("Sync").build();
         git_group.set_margin_top(18);
 
         let sync_row = SwitchRow::builder()
@@ -327,6 +376,11 @@ fn selected_index(default_color: &str) -> u32 {
         .iter()
         .position(|name| *name == default_color)
         .unwrap_or(0) as u32
+}
+
+/// Index of `ms` in the auto-save presets, falling back to the first.
+fn save_delay_index(ms: u64) -> u32 {
+    SAVE_DELAYS_MS.iter().position(|&value| value == ms).unwrap_or(0) as u32
 }
 
 /// Horizontal padding for preference rows.

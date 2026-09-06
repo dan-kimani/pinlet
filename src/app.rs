@@ -9,10 +9,10 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use adw::prelude::*;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use gtk4::gio;
 use gtk4::glib::{self, ControlFlow, SourceId};
-use gtk4::prelude::*;
 use uuid::Uuid;
 
 use crate::cli;
@@ -516,8 +516,9 @@ impl App {
         self.apply_color_mode();
     }
 
-    /// Lock an unlocked note, or unlock a locked one, prompting for
-    /// the password first (spec §3.10).
+    /// Lock an unlocked note, or unlock a locked one. Locking uses the
+    /// master password set in Preferences (no prompt); unlocking still
+    /// prompts, so the note stays unreadable without the password.
     fn lock_or_unlock(&self, id: Uuid) {
         let Some(window) = self.inner.windows.borrow().get(&id).cloned() else {
             return;
@@ -536,10 +537,34 @@ impl App {
                 this.unlock_note(id, &password);
             });
         } else {
-            password_dialog::present(&dialog_window, true, move |password| {
-                this.lock_note(id, &password);
-            });
+            let password = self.inner.local_state.borrow().master_password.clone();
+            if password.is_empty() {
+                self.show_no_password_alert(&dialog_window);
+            } else {
+                self.lock_note(id, &password);
+            }
         }
+    }
+
+    /// Tell the user to set a master password in Preferences first.
+    fn show_no_password_alert(&self, parent: &gtk4::Window) {
+        let dialog = adw::MessageDialog::builder()
+            .heading("No password set")
+            .body("Set a master password in Preferences before locking notes.")
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("prefs", "Open Preferences");
+        dialog.set_response_appearance("prefs", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("prefs"));
+        dialog.set_transient_for(Some(parent));
+        let this = self.clone();
+        dialog.connect_response(None, move |dialog, response| {
+            if response == "prefs" {
+                this.open_settings();
+            }
+            dialog.close();
+        });
+        dialog.present();
     }
 
     /// Encrypt the note and move it to the local-only `locked/` dir.
@@ -992,6 +1017,7 @@ impl App {
                 &self.inner.gtk_app,
                 &self.inner.settings.borrow(),
                 self.inner.settings_path.clone(),
+                &self.inner.local_state.borrow().master_password,
                 shortcut_support,
                 shortcut_subtitle,
                 SettingsCallbacks {
@@ -1063,6 +1089,23 @@ impl App {
                         let this = self.clone();
                         move || {
                             let _ = this.inner.tx.send(Msg::GitPush);
+                        }
+                    }),
+                    on_master_password: Box::new({
+                        let this = self.clone();
+                        move |password| {
+                            {
+                                let mut state = this.inner.local_state.borrow_mut();
+                                state.master_password = password;
+                            }
+                            if let Err(err) = this
+                                .inner
+                                .local_state
+                                .borrow()
+                                .save(&this.inner.local_state_path)
+                            {
+                                eprintln!("failed to save local state: {err}");
+                            }
                         }
                     }),
                 },
