@@ -8,7 +8,7 @@ use gtk4::{Align, Box as GtkBox, Button, Calendar, Label, Orientation, SpinButto
 
 /// Show the reminder picker: a calendar plus hour/minute spinners.
 /// `on_add` receives the chosen time in UTC.
-pub fn present(window: &gtk4::ApplicationWindow, on_add: impl Fn(DateTime<Utc>) + 'static) {
+pub fn present(window: &gtk4::Window, on_add: impl Fn(DateTime<Utc>) + 'static) {
     let calendar = Calendar::new();
     let hour = SpinButton::with_range(0.0, 23.0, 1.0);
     let minute = SpinButton::with_range(0.0, 59.0, 1.0);

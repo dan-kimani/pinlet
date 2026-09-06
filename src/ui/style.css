@@ -2,33 +2,60 @@
  * Every selector is scoped with a `pinlet-*` class so nothing leaks
  * to other applications on the same display. */
 
+/* Each color class pairs its background with a foreground that stays
+ * readable regardless of the active theme's light/dark mode.
+ * background-image: none defeats Adwaita's button gradient so the
+ * color shows on swatches as well as on windows. */
 .pinlet-yellow {
   background-color: #fbf3b0;
+  background-image: none;
+  color: #4a4523;
 }
 
 .pinlet-green {
   background-color: #c9efc2;
+  background-image: none;
+  color: #1f3d1c;
 }
 
 .pinlet-blue {
   background-color: #b9dcf6;
+  background-image: none;
+  color: #173a54;
 }
 
 .pinlet-pink {
   background-color: #f6c9dd;
+  background-image: none;
+  color: #54203a;
 }
 
 .pinlet-purple {
   background-color: #dac9f6;
+  background-image: none;
+  color: #2e2354;
 }
 
 .pinlet-charcoal {
   background-color: #3c3f42;
+  background-image: none;
+  color: #ececec;
 }
 
 headerbar.pinlet-header {
   background: transparent;
   box-shadow: none;
+}
+
+.pinlet-swatch {
+  border-radius: 9999px;
+  min-width: 16px;
+  min-height: 16px;
+}
+
+/* Preferences: a small margin below each group title. */
+window.pinlet-settings preferencesgroup > box > box.header.single-line {
+  margin-bottom: 2px;
 }
 
 textview.pinlet-body,
@@ -37,6 +64,30 @@ textview.pinlet-body text {
   font-size: 14pt;
 }
 
-window.pinlet-charcoal textview.pinlet-body text {
+/* The theme's own `textview` color (light text in dark mode) is an
+ * explicit value on that node, which always beats values inherited
+ * from the window — so the foreground is pinned on the textview node
+ * itself, per note color. */
+window.pinlet-yellow textview.pinlet-body {
+  color: #4a4523;
+}
+
+window.pinlet-green textview.pinlet-body {
+  color: #1f3d1c;
+}
+
+window.pinlet-blue textview.pinlet-body {
+  color: #173a54;
+}
+
+window.pinlet-pink textview.pinlet-body {
+  color: #54203a;
+}
+
+window.pinlet-purple textview.pinlet-body {
+  color: #2e2354;
+}
+
+window.pinlet-charcoal textview.pinlet-body {
   color: #ececec;
 }

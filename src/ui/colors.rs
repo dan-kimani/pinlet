@@ -17,11 +17,14 @@ impl NoteColor {
     }
 }
 
-/// CSS for a custom hex note color (dynamic, per window).
+/// CSS for a custom hex note color (dynamic, per window): the same
+/// background/foreground pairing the palette classes use, with the
+/// foreground picked by luminance for readability.
 pub fn css_for_custom(hex: &str) -> String {
     format!(
-        ".pinlet-custom {{ background-color: {hex}; }} \
-         window.pinlet-custom textview.pinlet-body text {{ color: {}; }}",
+        ".pinlet-custom {{ background-color: {hex}; background-image: none; color: {}; }} \
+         window.pinlet-custom textview.pinlet-body {{ color: {}; }}",
+        foreground_for(hex),
         foreground_for(hex)
     )
 }

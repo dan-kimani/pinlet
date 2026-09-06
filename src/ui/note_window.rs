@@ -1,15 +1,25 @@
 //! The sticky note window: header actions and Markdown body.
 
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
 use adw::prelude::*;
 use chrono::{DateTime, Local, Utc};
+use gtk4::gdk;
+use gtk4::glib;
+use gtk4_layer_shell::{Edge, Layer, LayerShell};
+
+use crate::timer::cancel_source;
+
+use crate::ui::x11;
 use gtk4::{
     Button, FlowBox, HeaderBar, Label, ListBox, ListBoxRow, MenuButton, Orientation, Popover,
-    ScrolledWindow, TextView,
+    ScrolledWindow, TextBuffer, TextIter, TextWindowType, TextView,
 };
 
 use crate::app::SharedNote;
+use crate::pinning::PinBackend;
 use crate::storage::{NoteColor, Recurrence, Reminder, WindowGeometry};
 use crate::ui::colors;
 use crate::ui::reminder_dialog;
@@ -33,12 +43,24 @@ pub struct NoteCallbacks {
     pub on_delete_reminder: Box<dyn Fn(usize)>,
     /// The window was resized or moved (debounced geometry save).
     pub on_geometry_changed: Box<dyn Fn()>,
+    /// The user toggled desktop pinning.
+    pub on_toggle_pin: Box<dyn Fn()>,
+    /// The user asked to lock or unlock the note.
+    pub on_lock_requested: Box<dyn Fn()>,
 }
 
 /// One window per note, styled like a sheet of paper.
 #[derive(Clone)]
 pub struct NoteWindow {
-    window: gtk4::ApplicationWindow,
+    window: gtk4::Window,
+    /// True when the window lives on the desktop layer (spec §3.6).
+    pinned: bool,
+    /// True when pinned via an X11 desktop-type window (compositors
+    /// without layer-shell, e.g. Ubuntu's mutter).
+    x11_desktop: bool,
+    /// Position of a pinned window — layer-shell margins, or the
+    /// tracked X11 position — updated while dragging.
+    margins: Rc<Cell<(i32, i32)>>,
     /// Kept alive so a custom hex color stays applied.
     _custom_css: Option<gtk4::CssProvider>,
 }
@@ -50,17 +72,64 @@ impl NoteWindow {
         shared: Rc<SharedNote>,
         geometry: Option<WindowGeometry>,
         callbacks: NoteCallbacks,
+        pin_backend: PinBackend,
     ) -> Self {
         let callbacks = Rc::new(callbacks);
         let color = shared.note.borrow().color.clone();
+        let pinned = shared.note.borrow().is_pinned_to_desktop;
 
-        let window = gtk4::ApplicationWindow::builder()
-            .application(app)
-            .title(shared.display_title())
-            .default_width(geometry.map_or(300, |g| g.width))
-            .default_height(geometry.map_or(320, |g| g.height))
-            .build();
+        // Position of a pinned note: X11 coordinates or layer-shell
+        // margins, tracked while dragging.
+        let margins = Rc::new(Cell::new((
+            geometry.map_or(60, |g| g.x),
+            geometry.map_or(60, |g| g.y),
+        )));
+
+        // Desktop pinning, two mechanisms in-app:
+        // - an X11 desktop-type window (works under Ubuntu's mutter,
+        //   whose layer-shell protocol is compiled out);
+        // - the layer-shell protocol (KDE, wlroots compositors).
+        let x11_desktop = pinned && pin_backend == PinBackend::X11;
+        let x11_display = if x11_desktop { x11::display() } else { None };
+        let window: gtk4::Window = if x11_desktop {
+            let plain = gtk4::Window::builder()
+                .title(shared.display_title())
+                .default_width(geometry.map_or(300, |g| g.width))
+                .default_height(geometry.map_or(320, |g| g.height))
+                .build();
+            if let Some(x11_display) = x11_display.as_ref() {
+                plain.set_display(x11_display);
+            }
+            plain
+        } else {
+            gtk4::ApplicationWindow::builder()
+                .application(app)
+                .title(shared.display_title())
+                .default_width(geometry.map_or(300, |g| g.width))
+                .default_height(geometry.map_or(320, |g| g.height))
+                .build()
+                .upcast()
+        };
         window.set_css_classes(&[color.css_class()]);
+
+        if x11_desktop {
+            let (left, top) = margins.get();
+            window.connect_realize(move |window| {
+                x11::apply(window, left, top);
+            });
+            window.connect_map(move |window| {
+                x11::apply(window, left, top);
+            });
+        } else if pinned && pin_backend == PinBackend::LayerShell {
+            window.init_layer_shell();
+            window.set_layer(Layer::Background);
+            window.set_anchor(Edge::Left, true);
+            window.set_anchor(Edge::Top, true);
+            let (left, top) = margins.get();
+            window.set_margin(Edge::Left, left);
+            window.set_margin(Edge::Top, top);
+            window.set_exclusive_zone(0);
+        }
 
         // Header bar with quick actions.
         let header = HeaderBar::builder().show_title_buttons(true).build();
@@ -92,8 +161,10 @@ impl NoteWindow {
             swatch.connect_clicked(move |_| {
                 shared.note.borrow_mut().color = swatch_color.clone();
                 window.set_css_classes(&[swatch_color.css_class()]);
-                let body = shared.body.borrow();
-                (callbacks.on_changed)(body.clone());
+                // Clone the body and drop the borrow before calling
+                // out: on_changed writes back into `shared.body`.
+                let body = shared.body.borrow().clone();
+                (callbacks.on_changed)(body);
             });
             palette.insert(&swatch, -1);
         }
@@ -152,20 +223,124 @@ impl NoteWindow {
             });
         }
 
-        // Phase 2/3 placeholders: locking, pinning.
-        for (icon, tooltip) in [
-            ("system-lock-screen-symbolic", "Lock — coming soon"),
-            ("view-pin-symbolic", "Pin to desktop — coming soon"),
-        ] {
-            let stub = Button::from_icon_name(icon);
-            stub.set_sensitive(false);
-            stub.set_tooltip_text(Some(tooltip));
-            header.pack_end(&stub);
+        // Desktop pinning toggle (spec §3.6).
+        let pin_btn = Button::from_icon_name("view-pin-symbolic");
+        if pin_backend != PinBackend::None {
+            pin_btn.set_tooltip_text(Some(if pinned {
+                "Unpin from desktop"
+            } else {
+                "Pin to desktop"
+            }));
+            if pinned {
+                pin_btn.add_css_class("suggested-action");
+            }
+            let callbacks = callbacks.clone();
+            pin_btn.connect_clicked(move |_| (callbacks.on_toggle_pin)());
+        } else {
+            pin_btn.set_sensitive(false);
+            pin_btn.set_tooltip_text(Some(
+                "Pinning unavailable — no layer-shell and no X11/XWayland desktop",
+            ));
         }
+
+        // Locking (spec §3.10).
+        let locked = shared.note.borrow().is_locked;
+        let lock_btn = Button::from_icon_name("system-lock-screen-symbolic");
+        lock_btn.set_tooltip_text(Some(if locked {
+            "Unlock note"
+        } else {
+            "Lock note"
+        }));
+        {
+            let callbacks = callbacks.clone();
+            lock_btn.connect_clicked(move |_| (callbacks.on_lock_requested)());
+        }
+
         header.pack_end(&delete_btn);
+        header.pack_end(&pin_btn);
+        header.pack_end(&lock_btn);
         header.pack_end(&reminder_btn);
         header.pack_start(&color_btn);
         header.pack_start(&new_btn);
+
+        // Pinned windows have no window manager, so the header
+        // doubles as a drag handle: layer margins or the X11
+        // position, depending on the mechanism. Under the shell
+        // extension the note is a normal window, so it keeps normal
+        // window-manager dragging.
+        if pinned && (x11_desktop || pin_backend == PinBackend::LayerShell) {
+            let drag = gtk4::GestureDrag::new();
+            // The X11 desktop window is dragged by a polling loop that reads
+            // the pointer position and button state via `query_pointer`, so it
+            // keeps tracking even after GTK ends its gesture (which happens
+            // once the window starts moving under the pointer). Layer-shell
+            // windows keep a margin-based drag.
+            let drag_poll: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+            if x11_desktop {
+                let window = window.clone();
+                let margins = margins.clone();
+                let callbacks = callbacks.clone();
+                let drag_poll = drag_poll.clone();
+                drag.connect_drag_begin(move |_gesture, _x, _y| {
+                    if let Some(id) = drag_poll.borrow_mut().take() {
+                        cancel_source(id);
+                    }
+                    let Some((start_px, start_py, _)) = x11::drag_pointer() else {
+                        return;
+                    };
+                    let (start_left, start_top) = margins.get();
+                    let window = window.clone();
+                    let margins = margins.clone();
+                    let callbacks = callbacks.clone();
+                    let poll_poll = drag_poll.clone();
+                    let source = glib::timeout_add_local(Duration::from_millis(16), move || {
+                        let Some((px, py, held)) = x11::drag_pointer() else {
+                            return glib::ControlFlow::Break;
+                        };
+                        if !held {
+                            poll_poll.borrow_mut().take();
+                            (callbacks.on_geometry_changed)();
+                            return glib::ControlFlow::Break;
+                        }
+                        let left = start_left + (px - start_px);
+                        let top = start_top + (py - start_py);
+                        x11::move_to(&window, left, top);
+                        margins.set((left, top));
+                        glib::ControlFlow::Continue
+                    });
+                    *drag_poll.borrow_mut() = Some(source);
+                });
+            } else {
+                let drag_start = Rc::new(Cell::new((0i32, 0i32)));
+                {
+                    let margins = margins.clone();
+                    let drag_start = drag_start.clone();
+                    drag.connect_drag_begin(move |_gesture, _x, _y| {
+                        drag_start.set(margins.get());
+                    });
+                }
+                {
+                    let window = window.clone();
+                    let margins = margins.clone();
+                    let drag_start = drag_start.clone();
+                    drag.connect_drag_update(move |_gesture, dx, dy| {
+                        let (start_left, start_top) = drag_start.get();
+                        let left = start_left + dx as i32;
+                        let top = start_top + dy as i32;
+                        window.set_margin(Edge::Left, left);
+                        window.set_margin(Edge::Top, top);
+                        margins.set((left, top));
+                    });
+                }
+                {
+                    let callbacks = callbacks.clone();
+                    drag.connect_drag_end(move |_gesture, _dx, _dy| {
+                        (callbacks.on_geometry_changed)();
+                    });
+                }
+            }
+            header.add_controller(drag);
+        }
 
         // Markdown body.
         let text_view = TextView::builder()
@@ -176,7 +351,15 @@ impl NoteWindow {
             .right_margin(12)
             .build();
         text_view.add_css_class("pinlet-body");
-        text_view.buffer().set_text(&shared.body.borrow());
+        if locked {
+            text_view.set_editable(false);
+            text_view.buffer().set_text(
+                "🔒 This note is locked.\n\n\
+                 Unlock it with the lock button to view and edit its contents.",
+            );
+        } else {
+            text_view.buffer().set_text(&shared.body.borrow());
+        }
 
         {
             let callbacks = callbacks.clone();
@@ -188,6 +371,55 @@ impl NoteWindow {
                 (callbacks.on_changed)(text);
             });
         }
+
+        // Interactive checklists (spec §3.2): a click on a checkbox
+        // glyph toggles it.
+        let click = gtk4::GestureClick::new();
+        {
+            let text_view = text_view.clone();
+            click.connect_pressed(move |_gesture, _n_press, x, y| {
+                if let Some((iter, _trailing)) = text_view.iter_at_position(x as i32, y as i32) {
+                    let buffer = text_view.buffer();
+                    let _ = toggle_checkbox_at(&text_view, &buffer, &iter, Some(x));
+                }
+            });
+        }
+        text_view.add_controller(click);
+
+        // Ctrl+Enter toggles the checkbox on the cursor line.
+        let keys = gtk4::EventControllerKey::new();
+        {
+            let text_view = text_view.clone();
+            keys.connect_key_pressed(move |_, keyval, _code, state| {
+                if keyval == gdk::Key::Return
+                    && state.contains(gdk::ModifierType::CONTROL_MASK)
+                {
+                    let buffer = text_view.buffer();
+                    let cursor = buffer.iter_at_offset(buffer.cursor_position());
+                    if toggle_checkbox_at(&text_view, &buffer, &cursor, None) {
+                        return glib::Propagation::Stop;
+                    }
+                }
+                glib::Propagation::Proceed
+            });
+        }
+        text_view.add_controller(keys);
+
+        // Drag & drop (spec §3.6): text and file URIs append to the
+        // note, images become Markdown image links.
+        // STRING-derived formats cover text/plain and text/uri-list.
+        let drop_target = gtk4::DropTarget::new(glib::Type::STRING, gdk::DragAction::COPY);
+        {
+            let buffer = text_view.buffer();
+            drop_target.connect_drop(move |_target, value, _x, _y| {
+                if let Ok(text) = value.get::<String>() {
+                    append_drop(&buffer, &text);
+                    return true;
+                }
+                false
+            });
+        }
+        text_view.add_controller(drop_target);
 
         let scroller = ScrolledWindow::builder()
             .child(&text_view)
@@ -239,6 +471,9 @@ impl NoteWindow {
 
         Self {
             window,
+            pinned,
+            x11_desktop,
+            margins,
             _custom_css: custom_css,
         }
     }
@@ -246,6 +481,29 @@ impl NoteWindow {
     /// Show and focus the window.
     pub fn present(&self) {
         self.window.present();
+    }
+
+    /// Restyle the window with `color` (spec Mode B applies a global
+    /// color without changing the note's stored color).
+    pub fn apply_color(&self, color: &NoteColor) {
+        self.window.set_css_classes(&[color.css_class()]);
+    }
+
+    /// The underlying window (for dialogs parented to this note).
+    pub fn window(&self) -> &gtk4::Window {
+        &self.window
+    }
+
+    /// Show a transient error dialog over this window.
+    pub fn show_error(&self, message: &str) {
+        let dialog = adw::MessageDialog::builder()
+            .heading("Pinlet")
+            .body(message)
+            .build();
+        dialog.add_response("ok", "OK");
+        dialog.set_transient_for(Some(&self.window));
+        dialog.connect_response(None, |dialog, _| dialog.close());
+        dialog.present();
     }
 
     /// Whether the window is currently visible.
@@ -278,13 +536,36 @@ impl NoteWindow {
     pub fn position_on_screen(&self) -> (f64, f64) {
         self.window.surface_transform()
     }
+
+    /// Whether this window lives on the desktop layer.
+    pub fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+
+    /// Whether the compositor actually put this window on a layer
+    /// (the truth, as opposed to the requested pin state).
+    pub fn is_layer_window(&self) -> bool {
+        self.window.is_layer_window()
+    }
+
+    /// Whether this is an X11 desktop-type window (the layer-shell
+    /// alternative used under Ubuntu's mutter).
+    pub fn is_desktop_window(&self) -> bool {
+        self.x11_desktop
+    }
+
+    /// Position of a pinned window: its layer-shell margins.
+    pub fn pinned_position(&self) -> (f64, f64) {
+        let (left, top) = self.margins.get();
+        (f64::from(left), f64::from(top))
+    }
 }
 
 /// Build the reminder popover content fresh (called on every show).
 fn build_reminders_popover(
     shared: &Rc<SharedNote>,
     callbacks: &Rc<NoteCallbacks>,
-    window: &gtk4::ApplicationWindow,
+    window: &gtk4::Window,
 ) -> gtk4::Box {
     let content = gtk4::Box::new(Orientation::Vertical, 4);
 
@@ -344,4 +625,97 @@ fn format_reminder(reminder: &Reminder) -> String {
         Recurrence::Weekdays => format!("{when} · weekdays"),
         Recurrence::Custom(n) => format!("{when} · every {n} d"),
     }
+}
+
+/// Toggle the checkbox on `iter`'s line, if the line has one and the
+/// click (when given) landed on the glyph itself.
+fn toggle_checkbox_at(
+    view: &TextView,
+    buffer: &TextBuffer,
+    iter: &TextIter,
+    click_x: Option<f64>,
+) -> bool {
+    let line = iter.line();
+    let Some(mut start) = buffer.iter_at_line(line) else {
+        return false;
+    };
+    let Some(end) = buffer.iter_at_line(line + 1) else {
+        return false;
+    };
+    let text = buffer.text(&start, &end, false).to_string();
+    let Some((offset, is_checked)) = checkbox_offset(&text) else {
+        return false;
+    };
+
+    // Only toggle when the click landed on the glyph; keyboard
+    // toggles pass `None` and always apply.
+    if let Some(x) = click_x {
+        let mut glyph = start;
+        glyph.forward_chars(offset as i32);
+        let rect = view.iter_location(&glyph);
+        let (glyph_x, _) = view.buffer_to_window_coords(TextWindowType::Text, rect.x(), rect.y());
+        if x < f64::from(glyph_x) - 6.0
+            || x > f64::from(glyph_x) + f64::from(rect.width()) + 6.0
+        {
+            return false;
+        }
+    }
+
+    let replacement = if is_checked { " " } else { "x" };
+    start.forward_chars(offset as i32);
+    let mut glyph_end = start;
+    glyph_end.forward_char();
+    buffer.begin_user_action();
+    buffer.delete(&mut start, &mut glyph_end);
+    buffer.insert(&mut start, replacement);
+    buffer.end_user_action();
+    true
+}
+
+/// If the line has a checkbox (`- [ ]` / `- [x]`), return the char
+/// offset of the state glyph and whether it is checked.
+fn checkbox_offset(line: &str) -> Option<(usize, bool)> {
+    let rest = line.strip_prefix("- [")?;
+    match rest.chars().next() {
+        Some(' ') => Some((3, false)),
+        Some('x') | Some('X') => Some((3, true)),
+        _ => None,
+    }
+}
+
+/// Append dropped text to the end of the buffer: image file URIs
+/// become Markdown image links, other URIs become links, and plain
+/// text is appended as-is.
+fn append_drop(buffer: &TextBuffer, text: &str) {
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| {
+            if line.starts_with("file://") {
+                let is_image = [".png", ".jpg", ".jpeg", ".svg", ".webp"]
+                    .iter()
+                    .any(|ext| line.ends_with(ext));
+                if is_image {
+                    format!("![image]({line})")
+                } else {
+                    format!("[file]({line})")
+                }
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect();
+
+    let mut end = buffer.end_iter();
+    let mut inserted = String::new();
+    if !end.starts_line() {
+        inserted.push('\n');
+    }
+    inserted.push_str(&lines.join("\n"));
+    inserted.push('\n');
+
+    buffer.begin_user_action();
+    buffer.insert(&mut end, &inserted);
+    buffer.end_user_action();
+    let end = buffer.end_iter();
+    buffer.place_cursor(&end);
 }

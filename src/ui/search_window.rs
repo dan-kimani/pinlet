@@ -13,6 +13,7 @@ use gtk4::{
 use uuid::Uuid;
 
 use crate::search::SearchHit;
+use crate::timer::cancel_source;
 
 /// Debounce for search-as-you-type.
 const QUERY_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -76,7 +77,7 @@ impl SearchWindow {
             this.entry.connect_changed(move |entry| {
                 let text = entry.text().to_string();
                 if let Some(source) = source_cell.borrow_mut().take() {
-                    source.remove();
+                    cancel_source(source);
                 }
                 let query = on_query.clone();
                 let source = glib::timeout_add_local_once(QUERY_DEBOUNCE, move || query(text));
