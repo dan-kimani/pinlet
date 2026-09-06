@@ -56,4 +56,14 @@ impl Settings {
         let raw = fs::read_to_string(path)?;
         serde_json::from_str(&raw).map_err(|err| AppError::Settings(err.to_string()))
     }
+
+    /// Atomically persist to `path`.
+    pub fn save(&self, path: &Path) -> AppResult<()> {
+        let raw = serde_json::to_string_pretty(self)
+            .map_err(|err| AppError::Settings(err.to_string()))?;
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, raw)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
 }
