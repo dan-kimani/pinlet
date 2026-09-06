@@ -16,7 +16,7 @@ A native, high-performance, and beautifully designed sticky notes application bu
 - **Git Integration**: git CLI for v1 auto-commits; gix (pure Rust git) for built-in pull/push sync in Phase 4
 - **System Tray Protocol**: ksni (Pure Rust StatusNotifierItem DBus implementation)
 - **Desktop Integration**: ashpd / notify-rust (Freedesktop portal integration & system notifications)
-- **Desktop Layer Positioning**: gtk4-layer-shell (For desktop wallpaper-level note pinning)
+- **Desktop Layer Positioning**: gtk4-layer-shell (wallpaper-level note pinning) plus `_NET_WM_WINDOW_TYPE_DESKTOP` X11/XWayland windows
 - **Time & Date Operations**: chrono
 - **IPC & DBus**: zbus (single-instance handoff, GNOME Shell search provider)
 - **Cryptography**: argon2 + chacha20poly1305 (encrypted locked notes)
@@ -112,7 +112,10 @@ A native, high-performance, and beautifully designed sticky notes application bu
 
 ### 3.6 Advanced Desktop Features
 
-- **Desktop Pinning**: Utilizes Wayland Layer Shell protocols to pin notes down behind other application windows directly to the desktop workspace.
+- **Desktop Pinning**: Pins notes down behind other application windows directly to the desktop workspace. The rendering mechanism is chosen per session:
+  - **X11 (Xorg) / XWayland**: a window carrying `_NET_WM_WINDOW_TYPE_DESKTOP` (above the wallpaper, below all windows, exempt from "show desktop").
+  - **Wayland + wlr-layer-shell** (KDE Plasma 6, wlroots compositors): the layer-shell protocol.
+  - The pin button disables with an explanation only when neither of these is available.
 - **Privacy Locking**: Lock individual notes containing sensitive information; unlocking requires password or Linux PAM authentication.
 - **Drag and Drop (Drop Zone)**: Drag text, links, or image files onto a note window or system tray icon to automatically append content.
 
@@ -131,7 +134,7 @@ A native, high-performance, and beautifully designed sticky notes application bu
 ### 3.9 Quick Capture
 
 - **CLI Capture**: `pinlet "buy milk"` (or `pinlet --new --color Yellow "..."`) creates a note in the running instance via DBus single-instance handoff; starts the app if it is not running.
-- **Global Shortcut**: User-configurable hotkey registered through the XDG GlobalShortcuts portal (ashpd); invokes the same capture path as the CLI.
+- **Global Shortcut**: User-configurable hotkey creating a note from anywhere. Preferred mechanism: the XDG GlobalShortcuts portal (ashpd); on GNOME < 47 a custom keybinding in `org.gnome.settings-daemon.plugins.media-keys` is registered as a fallback. Both invoke the same capture path as the CLI.
 - **Clipboard Capture**: Optional action to append the current clipboard contents to a note.
 
 ### 3.10 Encrypted Locked Notes
