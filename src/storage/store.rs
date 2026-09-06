@@ -27,7 +27,14 @@ impl NoteStore {
     pub fn open(root: impl Into<PathBuf>) -> AppResult<Self> {
         let store = Self { root: root.into() };
         fs::create_dir_all(store.notes_dir())?;
+        fs::create_dir_all(store.locked_dir())?;
         Ok(store)
+    }
+
+    /// Directory holding locked (encrypted) note files. Git-ignored:
+    /// locked notes never sync (spec §3.10).
+    pub fn locked_dir(&self) -> PathBuf {
+        self.root.join("locked")
     }
 
     /// Repository root (the data directory).
@@ -45,40 +52,53 @@ impl NoteStore {
         self.notes_dir().join(format!("{id}.md"))
     }
 
-    /// Load every readable note paired with its body text.
+    /// Load every readable note paired with its body text — plain
+    /// notes and locked notes (whose body is an encrypted blob).
     /// Malformed files are skipped with a warning, never fatal.
     pub fn load_all(&self) -> AppResult<Vec<(Note, String)>> {
         let mut notes = Vec::new();
-        for entry in fs::read_dir(self.notes_dir())? {
-            let path = entry?.path();
-            if !is_note_file(&path) {
-                continue;
-            }
-            match parse_note_file(&path) {
-                Ok(pair) => notes.push(pair),
-                Err(err) => eprintln!("skipping unreadable note: {err}"),
+        for dir in [self.notes_dir(), self.locked_dir()] {
+            for entry in fs::read_dir(&dir)? {
+                let path = entry?.path();
+                if !is_note_file(&path) {
+                    continue;
+                }
+                match parse_note_file(&path) {
+                    Ok(pair) => notes.push(pair),
+                    Err(err) => eprintln!("skipping unreadable note: {err}"),
+                }
             }
         }
         notes.sort_by_key(|(note, _)| note.created_at);
         Ok(notes)
     }
 
-    /// Atomically write the note file and bump `updated_at`.
+    /// Atomically write the note file and bump `updated_at`. Locked
+    /// notes are written to the git-ignored `locked/` directory; for
+    /// them `body` is the encrypted blob.
     pub fn save(&self, note: &mut Note, body: &str) -> AppResult<()> {
         note.updated_at = Some(Utc::now());
         let rendered = render_file(note, body)?;
-        let path = self.path_for(note.id);
+        let path = if note.is_locked {
+            self.locked_dir().join(format!("{}.md", note.id))
+        } else {
+            self.path_for(note.id)
+        };
         let tmp = path.with_extension("md.tmp");
         fs::write(&tmp, rendered)?;
         fs::rename(&tmp, &path)?;
         Ok(())
     }
 
-    /// Remove a note's file, if it exists.
+    /// Remove a note's files — plain and locked — if they exist.
     pub fn delete(&self, id: Uuid) -> AppResult<()> {
-        let path = self.path_for(id);
-        if path.exists() {
-            fs::remove_file(path)?;
+        for path in [
+            self.path_for(id),
+            self.locked_dir().join(format!("{id}.md")),
+        ] {
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
         }
         Ok(())
     }

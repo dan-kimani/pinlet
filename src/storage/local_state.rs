@@ -23,8 +23,8 @@ pub struct LocalState {
 }
 
 /// Window position and size. GTK4 cannot position normal windows on
-/// Wayland, so `x`/`y` are X11-only (and recorded for the layer-shell
-/// pinning work in Phase 3); width and height always restore.
+/// Wayland, so `x`/`y` are X11-only there — for pinned notes they are
+/// the layer-shell margins. Width and height always restore.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct WindowGeometry {
     /// Screen X coordinate (X11 only).

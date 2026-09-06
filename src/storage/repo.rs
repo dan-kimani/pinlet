@@ -43,15 +43,31 @@ impl GitRepo {
         Ok(())
     }
 
-    /// Create `.gitignore` on first run so machine-specific files
-    /// never reach version control.
+    /// Keep machine-specific and sensitive files out of version
+    /// control, merging new entries into an existing `.gitignore`.
     fn write_gitignore(&self) -> AppResult<()> {
         let path = self.dir.join(".gitignore");
-        if path.exists() {
-            return Ok(());
+        let mut contents = if path.exists() {
+            fs::read_to_string(&path)?
+        } else {
+            "# Machine-specific state — never sync\n".to_owned()
+        };
+        let mut changed = false;
+        for entry in [
+            "local-state.json",
+            "desktop-positions.json",
+            "locked/",
+            "*.md.tmp",
+        ] {
+            if !contents.lines().any(|line| line.trim() == entry) {
+                contents.push_str(entry);
+                contents.push('\n');
+                changed = true;
+            }
         }
-        let contents = "# Machine-specific state — never sync\nlocal-state.json\n*.md.tmp\n";
-        fs::write(path, contents)?;
+        if changed {
+            fs::write(path, contents)?;
+        }
         Ok(())
     }
 }
