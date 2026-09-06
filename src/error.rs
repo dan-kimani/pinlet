@@ -32,6 +32,10 @@ pub enum AppError {
     #[error("settings error: {0}")]
     Settings(String),
 
+    /// Note encryption/decryption failure.
+    #[error("crypto error: {0}")]
+    Crypto(String),
+
     /// The XDG data directory could not be resolved.
     #[error("could not resolve the XDG data directory")]
     DataDir,

@@ -1,6 +1,15 @@
 //! Binary entry point: parse the CLI, then start the GTK application.
+//!
+//! GtkApplication registers a DBus name, which makes Pinlet
+//! single-instance: a second `pinlet …` invocation forwards its
+//! command line to the running instance (the `command-line` signal)
+//! and exits, so quick capture always lands in the live app.
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use clap::Parser;
+use gtk4::gio;
 use gtk4::prelude::*;
 
 use pinlet::{app, cli, ui};
@@ -18,17 +27,48 @@ fn main() -> glib::ExitCode {
 
     let gtk_app = gtk4::Application::builder()
         .application_id("org.pinlet.Pinlet")
+        .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
         .build();
 
-    gtk_app.connect_activate(move |gtk_app| match app::App::new(gtk_app) {
-        Ok(app) => {
-            ui::ensure_styles();
-            app.activate(&cli);
+    // The app core is created on the first command-line delivery;
+    // later deliveries hand off to it.
+    let app_slot: Rc<RefCell<Option<app::App>>> = Rc::new(RefCell::new(None));
+
+    gtk_app.connect_command_line(move |gtk_app, command_line| {
+        let args: Vec<String> = command_line
+            .arguments()
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        // GtkApplication may include the program name as argv[0];
+        // `try_parse_from` expects argv[0] to be present, so strip
+        // the real program name and prepend a placeholder.
+        let filtered: Vec<String> = args
+            .into_iter()
+            .filter(|arg| !arg.ends_with("/pinlet"))
+            .collect();
+        let remote_cli =
+            cli::Cli::try_parse_from(std::iter::once("pinlet".to_owned()).chain(filtered))
+                .unwrap_or(cli::Cli { command: None });
+
+        // Clone the handle out of the slot first — the slot borrow
+        // must end before the None arm stores into it.
+        let existing = app_slot.borrow().clone();
+        match existing {
+            Some(app) => app.handle_command_line(&remote_cli),
+            None => match app::App::new(gtk_app) {
+                Ok(app) => {
+                    ui::ensure_styles();
+                    app.activate(&remote_cli);
+                    *app_slot.borrow_mut() = Some(app);
+                }
+                Err(err) => {
+                    eprintln!("failed to start Pinlet: {err}");
+                    gtk_app.quit();
+                }
+            },
         }
-        Err(err) => {
-            eprintln!("failed to start Pinlet: {err}");
-            gtk_app.quit();
-        }
+        0
     });
 
     gtk_app.run()

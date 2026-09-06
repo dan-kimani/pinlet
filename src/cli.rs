@@ -16,8 +16,8 @@ pub struct Cli {
 pub enum Command {
     /// Create a new note and open its window.
     New {
-        /// Initial note text.
-        #[arg(short, long)]
+        /// Initial note text (positional: `pinlet new "buy milk"`).
+        #[arg(value_name = "TEXT")]
         text: Option<String>,
         /// Initial note color (Yellow, Green, Blue, Pink, Purple, Charcoal).
         #[arg(short, long)]

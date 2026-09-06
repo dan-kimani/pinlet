@@ -115,6 +115,12 @@ impl Tray for PinletTray {
 
         items.push(MenuItem::Separator);
         items.push(Self::item("Search…", "system-search-symbolic", Msg::Search, &self.tx));
+        items.push(Self::item(
+            "Preferences",
+            "preferences-system-symbolic",
+            Msg::OpenSettings,
+            &self.tx,
+        ));
         items.push(Self::item("Quit", "application-exit-symbolic", Msg::Quit, &self.tx));
         items
     }

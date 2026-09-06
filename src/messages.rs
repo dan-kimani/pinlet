@@ -25,6 +25,8 @@ pub enum Msg {
     },
     /// Open the quick search window.
     Search,
+    /// Open the preferences window.
+    OpenSettings,
     /// Quit the application.
     Quit,
 }
