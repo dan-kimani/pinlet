@@ -606,13 +606,22 @@ impl App {
         self.reopen_window(id);
     }
 
-    /// Bring a note's window to the foreground, opening it as a plain
-    /// window if it is currently pinned on the desktop.
+    /// Bring a note's window to the foreground. A note pinned to the
+    /// desktop lives below regular windows, so it is unpinned first to let
+    /// the window come to the front.
     fn open_note(&self, id: Uuid) {
         if !self.inner.notes.borrow().contains_key(&id) {
             return;
         }
-        if self.inner.windows.borrow().contains_key(&id) {
+        if self
+            .inner
+            .notes
+            .borrow()
+            .get(&id)
+            .is_some_and(|shared| shared.note.borrow().is_pinned_to_desktop)
+        {
+            self.toggle_pin(id);
+        } else if self.inner.windows.borrow().contains_key(&id) {
             self.focus_note(id);
         } else {
             self.open_window(id);
@@ -787,8 +796,9 @@ impl App {
         self.refresh_tray_snapshot();
     }
 
-    /// Fire a desktop notification with Open Note / Snooze actions
-    /// (spec §3.4).
+    /// Fire a desktop notification with Open Note / Snooze / Dismiss
+    /// actions. If the notification hides on its own with no action taken,
+    /// the reminder is snoozed for five minutes so it resurfaces (spec §3.4).
     fn notify_reminder(&self, id: Uuid, due: DateTime<Utc>, note_title: String) {
         let body = if note_title.is_empty() {
             "A note reminder is due".to_owned()
@@ -802,6 +812,8 @@ impl App {
             .body(&body)
             .action("open", "Open Note")
             .action("snooze", "Snooze 10m")
+            .action("dismiss", "Dismiss")
+            .timeout(notify_rust::Timeout::Milliseconds(10_000))
             .show()
         {
             Ok(handle) => {
@@ -818,7 +830,18 @@ impl App {
                                 minutes: 10,
                             });
                         }
-                        _ => {}
+                        "dismiss" => {
+                            // Explicit dismissal: do not reschedule.
+                        }
+                        // "__closed": the notification hid without an action
+                        // (timed out). Snooze briefly so it resurfaces.
+                        _ => {
+                            let _ = tx.send(Msg::Snooze {
+                                note: id,
+                                due,
+                                minutes: 5,
+                            });
+                        }
                     });
                 });
             }

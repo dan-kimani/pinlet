@@ -187,6 +187,7 @@ impl NoteWindow {
                     &shared,
                     &callbacks,
                     &window,
+                    popover,
                 )));
             });
         }
@@ -566,6 +567,7 @@ fn build_reminders_popover(
     shared: &Rc<SharedNote>,
     callbacks: &Rc<NoteCallbacks>,
     window: &gtk4::Window,
+    popover: &gtk4::Popover,
 ) -> gtk4::Box {
     let content = gtk4::Box::new(Orientation::Vertical, 4);
 
@@ -573,18 +575,51 @@ fn build_reminders_popover(
         .selection_mode(gtk4::SelectionMode::None)
         .build();
     for (index, reminder) in shared.note.borrow().reminders.iter().enumerate() {
+        let reminder_label = format_reminder(reminder);
         let row = ListBoxRow::new();
         let row_box = gtk4::Box::new(Orientation::Horizontal, 8);
         let label = Label::builder()
-            .label(format_reminder(reminder))
+            .label(&reminder_label)
             .xalign(0.0)
             .hexpand(true)
             .build();
         let delete = Button::from_icon_name("user-trash-symbolic");
         delete.set_tooltip_text(Some("Delete reminder"));
         {
+            let shared = shared.clone();
             let callbacks = callbacks.clone();
-            delete.connect_clicked(move |_| (callbacks.on_delete_reminder)(index));
+            let window = window.clone();
+            let popover = popover.clone();
+            let reminder_label = reminder_label.clone();
+            delete.connect_clicked(move |_| {
+                let dialog = adw::MessageDialog::builder()
+                    .heading("Delete reminder?")
+                    .body(&reminder_label)
+                    .build();
+                dialog.add_response("cancel", "Cancel");
+                dialog.add_response("delete", "Delete");
+                dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+                dialog.set_default_response(Some("cancel"));
+                dialog.set_transient_for(Some(&window));
+                let shared = shared.clone();
+                let callbacks = callbacks.clone();
+                let window = window.clone();
+                let popover = popover.clone();
+                dialog.connect_response(None, move |dialog, response| {
+                    if response == "delete" {
+                        (callbacks.on_delete_reminder)(index);
+                        // Rebuild the list in place so the deletion is visible.
+                        popover.set_child(Some(&build_reminders_popover(
+                            &shared,
+                            &callbacks,
+                            &window,
+                            &popover,
+                        )));
+                    }
+                    dialog.close();
+                });
+                dialog.present();
+            });
         }
         row_box.append(&label);
         row_box.append(&delete);
