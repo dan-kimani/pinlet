@@ -66,6 +66,28 @@ searchable from the application menu), the app icon, and metadata. Its
 post-install script pre-creates `~/.local/share/pinlet` and `git init`s it for
 the installing user; the app also does this on first launch.
 
+### RPM (Fedora, RHEL, openSUSE)
+
+```bash
+cargo install cargo-generate-rpm
+cargo generate-rpm
+```
+
+Mirrors the Debian package — binary, launcher entry, icon, and metadata, with
+the same install-time setup script. Shared-library dependencies (GTK, libadwaita)
+are detected automatically; `git` is declared explicitly.
+
+### Arch (AUR)
+
+```bash
+cd arch
+makepkg -si
+```
+
+The [`arch/PKGBUILD`](arch/PKGBUILD) builds from source (a `-git` package ready
+for the AUR). The app creates its data directory and git repository on first
+launch.
+
 ## Usage
 
 | Command                                        | What it does                    |

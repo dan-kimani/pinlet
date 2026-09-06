@@ -13,6 +13,7 @@ pub mod app;
 pub mod cli;
 pub mod error;
 pub mod gnome_shortcut;
+pub mod markdown;
 pub mod messages;
 pub mod pinning;
 pub mod search;

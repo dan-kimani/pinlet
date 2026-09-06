@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "Pinlet — native sticky notes for Linux desktops"
 license = "MIT"
+repository = "https://github.com/dan-kimani/pinlet"
 
 [dependencies]
 argon2 = "0.6.0"
@@ -29,6 +30,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 gdk4-x11 = "0.9"
 x11rb = { version = "0.14.0", default-features = false }
 gdk4-x11-sys = "0.10"
+pulldown-cmark = "0.13.4"
 
 [package.metadata.deb]
 maintainer = "Daniel Kimani <dankim761@gmail.com>"
@@ -49,3 +51,33 @@ Pinlet — native sticky notes for Linux desktops.
 Notes are plain Markdown files inside a git repository you own, with
 reminders, checklists, desktop pinning, and git-based cross-machine
 syncing."""
+
+# RPM packaging (cargo generate-rpm). Shared-library deps (gtk4, libadwaita)
+# are auto-detected from the binary; `git` is a command, so it's listed
+# explicitly. Reuses the .deb postinst for install-time setup.
+[package.metadata.generate-rpm]
+summary = "Native sticky notes for the Linux desktop"
+post_install_script = "debian/postinst"
+
+[package.metadata.generate-rpm.requires]
+git = ""
+
+[[package.metadata.generate-rpm.assets]]
+source = "target/release/pinlet"
+dest = "/usr/bin/pinlet"
+mode = "755"
+
+[[package.metadata.generate-rpm.assets]]
+source = "assets/org.pinlet.Pinlet.desktop"
+dest = "/usr/share/applications/org.pinlet.Pinlet.desktop"
+mode = "644"
+
+[[package.metadata.generate-rpm.assets]]
+source = "assets/org.pinlet.Pinlet.svg"
+dest = "/usr/share/icons/hicolor/scalable/apps/org.pinlet.Pinlet.svg"
+mode = "644"
+
+[[package.metadata.generate-rpm.assets]]
+source = "assets/org.pinlet.Pinlet.metainfo.xml"
+dest = "/usr/share/metainfo/org.pinlet.Pinlet.metainfo.xml"
+mode = "644"

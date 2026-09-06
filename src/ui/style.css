@@ -91,3 +91,11 @@ window.pinlet-purple textview.pinlet-body {
 window.pinlet-charcoal textview.pinlet-body {
   color: #ececec;
 }
+
+/* Embedded task-list checkboxes sit inline with the note text. */
+.pinlet-checkbox {
+  min-width: 16px;
+  min-height: 16px;
+  padding: 0;
+  margin: 0 4px 0 0;
+}

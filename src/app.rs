@@ -1270,6 +1270,29 @@ mod tests {
         delete_note_scenario();
         picking_two_colors_scenario();
         pinning_scenario();
+        markdown_source_roundtrip();
+    }
+
+    /// The Markdown styler must keep the hidden formatting markers in the
+    /// buffer's canonical source. Reading with `include_hidden_chars = false`
+    /// drops them, which both corrupts saved notes and makes the markers
+    /// flicker as the source and styled states trade places (regression).
+    fn markdown_source_roundtrip() {
+        let view = gtk4::TextView::new();
+        let buffer = view.buffer();
+        buffer.set_text("## Header\n\n**bold** and *italic*");
+        let styler = crate::markdown::MarkdownStyler::new(&buffer);
+        styler.restyle(&view);
+
+        let start = buffer.start_iter();
+        let end = buffer.end_iter();
+        assert_eq!(
+            buffer.text(&start, &end, true).to_string(),
+            "## Header\n\n**bold** and *italic*"
+        );
+        let visible = buffer.text(&start, &end, false).to_string();
+        assert!(!visible.contains("##"));
+        assert!(!visible.contains("**"));
     }
 
     /// Toggling desktop pinning recreates the note as a background

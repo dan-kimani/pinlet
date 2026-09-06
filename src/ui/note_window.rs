@@ -19,6 +19,7 @@ use gtk4::{
 };
 
 use crate::app::SharedNote;
+use crate::markdown::{checkbox_offset, MarkdownStyler};
 use crate::pinning::PinBackend;
 use crate::storage::{NoteColor, Recurrence, Reminder, WindowGeometry};
 use crate::ui::colors;
@@ -362,14 +363,30 @@ impl NoteWindow {
             text_view.buffer().set_text(&shared.body.borrow());
         }
 
+        // WYSIWYG Markdown: the buffer keeps the canonical source while the
+        // styler hides markers and applies formatting tags.
+        let styler = MarkdownStyler::new(&text_view.buffer());
+        if !locked {
+            styler.restyle(&text_view);
+        }
+
         {
             let callbacks = callbacks.clone();
             let buffer = text_view.buffer();
+            let text_view = text_view.clone();
             buffer.connect_changed(move |buffer| {
+                // `true` includes the hidden markers, so the saved body stays
+                // the canonical Markdown source.
                 let text = buffer
-                    .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                    .text(&buffer.start_iter(), &buffer.end_iter(), true)
                     .to_string();
                 (callbacks.on_changed)(text);
+
+                // Re-render synchronously so the formatted view never lags the
+                // text. A debounce makes markers flicker as the raw source and
+                // the styled view trade places between keystrokes. Tag-only, so
+                // it cannot re-enter the `changed` signal.
+                styler.restyle(&text_view);
             });
         }
 
@@ -677,7 +694,8 @@ fn toggle_checkbox_at(
     let Some(end) = buffer.iter_at_line(line + 1) else {
         return false;
     };
-    let text = buffer.text(&start, &end, false).to_string();
+    // Include hidden markers so `- [ ]` still matches despite the bullet.
+    let text = buffer.text(&start, &end, true).to_string();
     let Some((offset, is_checked)) = checkbox_offset(&text) else {
         return false;
     };
@@ -705,17 +723,6 @@ fn toggle_checkbox_at(
     buffer.insert(&mut start, replacement);
     buffer.end_user_action();
     true
-}
-
-/// If the line has a checkbox (`- [ ]` / `- [x]`), return the char
-/// offset of the state glyph and whether it is checked.
-fn checkbox_offset(line: &str) -> Option<(usize, bool)> {
-    let rest = line.strip_prefix("- [")?;
-    match rest.chars().next() {
-        Some(' ') => Some((3, false)),
-        Some('x') | Some('X') => Some((3, true)),
-        _ => None,
-    }
 }
 
 /// Append dropped text to the end of the buffer: image file URIs
