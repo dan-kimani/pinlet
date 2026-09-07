@@ -609,6 +609,26 @@ impl NoteWindow {
             });
         }
 
+        // Esc closes the note through the same path as the window
+        // controls (save, geometry, deregister). Open popovers consume
+        // Escape themselves first, so this only fires when none is up.
+        {
+            let window = window.clone();
+            let esc = gtk4::ShortcutController::new();
+            esc.set_scope(gtk4::ShortcutScope::Managed);
+            if let Some(trigger) = gtk4::ShortcutTrigger::parse_string("Escape") {
+                let window = window.clone();
+                esc.add_shortcut(gtk4::Shortcut::new(
+                    Some(trigger),
+                    Some(gtk4::CallbackAction::new(move |_, _| {
+                        window.close();
+                        glib::Propagation::Stop
+                    })),
+                ));
+            }
+            window.add_controller(esc);
+        }
+
         // The X11 desktop window lives on a different display than the
         // default one, and the surface may not exist yet — resolve the
         // right display up front so a custom color lands correctly.
