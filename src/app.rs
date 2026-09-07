@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,10 +20,10 @@ use crate::cli;
 use crate::error::AppResult;
 use crate::messages::{Msg, SyncState};
 use crate::pinning::PinBackend;
-use crate::settings::{Settings, SETTINGS_FILE};
+use crate::settings::{SETTINGS_FILE, Settings};
 use crate::storage::{
-    crypto, GitRepo, LocalState, Note, NoteColor, NoteStore, Recurrence, Reminder,
-    WindowGeometry, DATA_DIR_NAME, LOCAL_STATE_FILE,
+    DATA_DIR_NAME, GitRepo, LOCAL_STATE_FILE, LocalState, Note, NoteColor, NoteStore, Recurrence,
+    Reminder, WindowGeometry, crypto,
 };
 use crate::timer::cancel_source;
 use crate::tray::{PinletTray, TraySnapshot};
@@ -82,6 +83,16 @@ struct AppInner {
     settings_path: PathBuf,
     /// Which shortcut backend this desktop can use.
     shortcut_backend: ShortcutBackend,
+    /// Gate for the portal shortcut listener: flipping the Preferences
+    /// switch updates this live, so the running thread honors it without
+    /// a restart.
+    shortcut_gate: Arc<AtomicBool>,
+    /// Whether the portal listener thread was already spawned (it can
+    /// only be spawned once; the gate switches it on and off).
+    shortcut_spawned: RefCell<bool>,
+    /// Serializes every `git` subprocess: the sync thread and the main
+    /// loop's auto-commits must never interleave and trip `index.lock`.
+    git_lock: Arc<Mutex<()>>,
     /// Which mechanism renders notes pinned to the desktop.
     pin_backend: PinBackend,
     /// The single preferences window, created lazily.
@@ -109,6 +120,9 @@ struct AppInner {
     /// Machine-local state (git-ignored).
     local_state: RefCell<LocalState>,
     local_state_path: PathBuf,
+    /// Pending debounced master-password save (the Preferences entry
+    /// fires on every keystroke).
+    master_pw_source: RefCell<Option<SourceId>>,
     /// Drain timer for the background message channel.
     msg_source: RefCell<Option<SourceId>>,
     /// Sender side of the background message channel.
@@ -136,7 +150,7 @@ impl App {
     /// repo, spawn the tray, and attach the message channel — in the
     /// standard XDG data directory.
     pub fn new(gtk_app: &gtk4::Application) -> AppResult<Self> {
-        Self::new_in(gtk_app, data_dir()?)
+        Self::new_in(gtk_app, data_dir())
     }
 
     /// Same as [`App::new`], with an explicit data directory
@@ -182,16 +196,23 @@ impl App {
         } else {
             ShortcutBackend::None
         };
+        let shortcut_gate = Arc::new(AtomicBool::new(settings.enable_global_shortcut));
+        let mut shortcut_spawned = false;
         if settings.enable_global_shortcut {
             match shortcut_backend {
-                ShortcutBackend::Portal => crate::shortcuts::spawn(tx.clone()),
+                ShortcutBackend::Portal => {
+                    crate::shortcuts::spawn(tx.clone(), shortcut_gate.clone());
+                    shortcut_spawned = true;
+                }
                 ShortcutBackend::GnomeSettings => crate::gnome_shortcut::enable(),
-                ShortcutBackend::None => {}
+                // No supported mechanism: self-heal settings migrated
+                // from a supporting system.
+                ShortcutBackend::None => {
+                    settings.enable_global_shortcut = false;
+                    shortcut_gate.store(false, Ordering::SeqCst);
+                    let _ = settings.save(&settings_path);
+                }
             }
-        } else if settings.enable_global_shortcut && shortcut_backend == ShortcutBackend::None {
-            // Self-heal settings migrated from a supporting system.
-            settings.enable_global_shortcut = false;
-            let _ = settings.save(&settings_path);
         }
 
         // System tray (best effort — some environments have no host).
@@ -212,6 +233,9 @@ impl App {
             settings: RefCell::new(settings),
             settings_path,
             shortcut_backend,
+            shortcut_gate,
+            shortcut_spawned: RefCell::new(shortcut_spawned),
+            git_lock: Arc::new(Mutex::new(())),
             pin_backend: PinBackend::detect(),
             settings_window: RefCell::new(None),
             notes: RefCell::new(notes),
@@ -226,6 +250,7 @@ impl App {
             geometry_source: RefCell::new(None),
             local_state: RefCell::new(local_state),
             local_state_path,
+            master_pw_source: RefCell::new(None),
             msg_source: RefCell::new(None),
             tx,
             tray_snapshot,
@@ -259,7 +284,7 @@ impl App {
             Some(cli::Command::New { text, color }) => {
                 let color = color
                     .as_deref()
-                    .and_then(|raw| raw.parse().ok())
+                    .and_then(NoteColor::parse_validated)
                     .unwrap_or_else(|| self.default_color());
                 self.new_note(color, text.clone().unwrap_or_default());
             }
@@ -276,13 +301,12 @@ impl App {
         // keep checking on a tick.
         self.check_due_reminders();
         let this = self.clone();
-        self.inner.tick_source.replace(Some(glib::timeout_add_local(
-            TICK_INTERVAL,
-            move || {
+        self.inner
+            .tick_source
+            .replace(Some(glib::timeout_add_local(TICK_INTERVAL, move || {
                 this.check_due_reminders();
                 ControlFlow::Continue
-            },
-        )));
+            })));
         self.refresh_tray_snapshot();
 
         // Establish the sync indicator and start the timed commit/push
@@ -304,11 +328,14 @@ impl App {
             Some(cli::Command::New { text, color }) => {
                 let color = color
                     .as_deref()
-                    .and_then(|raw| raw.parse().ok())
+                    .and_then(NoteColor::parse_validated)
                     .unwrap_or_else(|| self.default_color());
                 self.new_note(color, text.clone().unwrap_or_default());
             }
             Some(cli::Command::Sync) => self.sync_now(),
+            // `where` over remote activation: answer like the fresh
+            // process does instead of silently presenting windows.
+            Some(cli::Command::Where) => println!("{}", data_dir().display()),
             _ => {
                 // Plain re-invocation: bring the notes forward.
                 for window in self.inner.windows.borrow().values() {
@@ -318,14 +345,12 @@ impl App {
         }
     }
 
-    /// The default color for new notes, from settings.
+    /// The default color for new notes, from settings. Hand-edited
+    /// garbage falls back to Yellow instead of becoming a broken
+    /// custom color.
     fn default_color(&self) -> NoteColor {
-        self.inner
-            .settings
-            .borrow()
-            .default_color
-            .parse()
-            .expect("NoteColor parsing is infallible")
+        let settings = self.inner.settings.borrow();
+        NoteColor::parse_validated(&settings.default_color).unwrap_or(NoteColor::Yellow)
     }
 
     /// Register application actions with keyboard accelerators.
@@ -393,7 +418,9 @@ impl App {
         let branch = self.inner.settings.borrow().git_branch.clone();
         let url = self.inner.settings.borrow().git_remote_url.clone();
         let tx = self.inner.tx.clone();
+        let git_lock = self.inner.git_lock.clone();
         std::thread::spawn(move || {
+            let _guard = git_lock.lock().expect("git lock poisoned");
             let result = repo
                 .configure_sync(&url, &branch)
                 .and_then(|_| repo.pull(&branch));
@@ -411,7 +438,9 @@ impl App {
         let branch = self.inner.settings.borrow().git_branch.clone();
         let url = self.inner.settings.borrow().git_remote_url.clone();
         let tx = self.inner.tx.clone();
+        let git_lock = self.inner.git_lock.clone();
         std::thread::spawn(move || {
+            let _guard = git_lock.lock().expect("git lock poisoned");
             let result = repo
                 .configure_sync(&url, &branch)
                 .and_then(|_| repo.push(&branch));
@@ -461,17 +490,27 @@ impl App {
         };
         let commit_message = std::mem::take(&mut *self.inner.commit_message.borrow_mut());
         let tx = self.inner.tx.clone();
+        let git_lock = self.inner.git_lock.clone();
         std::thread::spawn(move || {
+            let _guard = git_lock.lock().expect("git lock poisoned");
             let outcome = run_sync(&repo, &url, &branch, &commit_message);
             let _ = tx.send(Msg::SyncState(outcome));
         });
     }
 
     /// Commit any pending local changes (periodic auto-commit).
+    /// Serialized against the sync thread like [`App::commit_now`].
+    /// Skipped while a merge conflict awaits manual resolution:
+    /// committing then only fails noisily and would flap the tray's
+    /// Conflict indicator into a generic error.
     fn commit_auto(&self) {
         if !self.inner.settings.borrow().git_sync_enabled {
             return;
         }
+        if self.inner.repo.has_conflicts().unwrap_or(false) {
+            return;
+        }
+        let _guard = self.inner.git_lock.lock().expect("git lock poisoned");
         let pending = std::mem::take(&mut *self.inner.commit_message.borrow_mut());
         let message = if pending.is_empty() {
             "Auto-commit".to_owned()
@@ -611,12 +650,16 @@ impl App {
                 move || {
                     this.save_now(id);
                     this.save_geometry();
+                    // The window is being destroyed: drop the registry
+                    // entry so the note can be reopened later, and dead
+                    // windows don't poison geometry saves or toggle-all.
+                    this.inner.windows.borrow_mut().remove(&id);
                     this.commit_now();
                 }
             }),
             on_add_reminder: Box::new({
                 let this = self.clone();
-                move |due| this.add_reminder(id, due)
+                move |due, recurrence| this.add_reminder(id, due, recurrence)
             }),
             on_delete_reminder: Box::new({
                 let this = self.clone();
@@ -646,7 +689,7 @@ impl App {
         self.inner.windows.borrow_mut().insert(id, window.clone());
         window.present();
         // Mode B (uniform colors) overrides the note's own color.
-        self.apply_color_mode();
+        self.apply_color_for(id, &window);
     }
 
     /// Lock an unlocked note, or unlock a locked one. Locking uses the
@@ -666,7 +709,7 @@ impl App {
         let this = self.clone();
         let dialog_window = window.window().clone();
         if is_locked {
-            password_dialog::present(&dialog_window, false, move |password| {
+            password_dialog::present(&dialog_window, move |password| {
                 this.unlock_note(id, &password);
             });
         } else {
@@ -718,12 +761,23 @@ impl App {
             }
         };
 
+        // Roll back the in-memory flags when the write fails, so a
+        // half-locked note (memory says locked, disk says plain) can
+        // never escape this function.
+        let was_locked = note.is_locked;
+        let old_title = note.title.clone();
         note.is_locked = true;
         note.title = "Locked".to_owned();
         if let Err(err) = self.inner.store.save(&mut note, &blob) {
+            note.is_locked = was_locked;
+            note.title = old_title;
             eprintln!("failed to save locked note {id}: {err}");
             return;
         }
+        drop(note);
+        // The in-memory body becomes the blob: unlocking decrypts it,
+        // and later saves rewrite the same ciphertext (never plaintext).
+        *shared.body.borrow_mut() = blob;
         // The plaintext copy in notes/ must go.
         let plain_path = self.inner.store.path_for(id);
         if plain_path.exists()
@@ -731,7 +785,6 @@ impl App {
         {
             eprintln!("failed to remove plaintext note {id}: {err}");
         }
-        drop(note);
         *self.inner.commit_message.borrow_mut() = format!("Lock note '{title}'");
         self.schedule_commit();
         self.refresh_tray_snapshot();
@@ -759,9 +812,13 @@ impl App {
             .split_once('\n')
             .map_or((plaintext.as_str(), ""), |(title, body)| (title, body));
         let mut note = shared.note.borrow_mut();
+        let was_locked = note.is_locked;
+        let old_title = note.title.clone();
         note.is_locked = false;
         note.title = title.to_owned();
         if let Err(err) = self.inner.store.save(&mut note, body) {
+            note.is_locked = was_locked;
+            note.title = old_title;
             eprintln!("failed to save unlocked note {id}: {err}");
             return;
         }
@@ -787,6 +844,10 @@ impl App {
 
     /// Close and reopen a note's window so it reflects new state.
     fn reopen_window(&self, id: Uuid) {
+        // Persist geometry first: the window is dropped from the
+        // registry below, so the close-request handler's save would
+        // otherwise miss a drag that hasn't debounced yet.
+        self.save_geometry();
         // Drop the registry borrow before closing: the close-request
         // handler runs synchronously and borrows the registries.
         let window = self.inner.windows.borrow_mut().remove(&id);
@@ -885,9 +946,14 @@ impl App {
     }
 
     /// Replace the note body and (re)start the debounced save timer.
+    /// Locked notes show a placeholder instead of the body: content
+    /// arriving here (a palette pick, a programmatic change) is not the
+    /// note and must never overwrite the encrypted blob.
     fn debounced_save(&self, id: Uuid, content: String) {
         if let Some(shared) = self.inner.notes.borrow().get(&id) {
-            *shared.body.borrow_mut() = content;
+            if !shared.note.borrow().is_locked {
+                *shared.body.borrow_mut() = content;
+            }
         }
         if let Some(source) = self.inner.save_sources.borrow_mut().remove(&id) {
             cancel_source(source);
@@ -901,26 +967,35 @@ impl App {
     /// Persist the note, refresh the index and tray, and schedule an
     /// auto-commit.
     fn save_now(&self, id: Uuid) {
-        let Some(shared) = self.inner.notes.borrow().get(&id).cloned() else {
+        let Some(shared) = self.persist_note(id) else {
             return;
         };
-        let body = shared.body.borrow().clone();
-        let mut note = shared.note.borrow_mut();
-        let is_locked = note.is_locked;
-        // For locked notes `body` is the encrypted blob: never derive
-        // a title from it.
-        if !is_locked {
-            note.title = Note::derive_title(&body);
-        }
-        if let Err(err) = self.inner.store.save(&mut note, &body) {
-            eprintln!("failed to save note {id}: {err}");
-            return;
-        }
-        drop(note);
         let display = shared.display_title();
         *self.inner.commit_message.borrow_mut() = format!("Update '{display}'");
         self.schedule_commit();
         self.refresh_tray_snapshot();
+    }
+
+    /// Write one note's file (deriving its title) without scheduling
+    /// commits or refreshing the tray — batch callers do that once.
+    /// Returns the note on success, `None` when it's gone or the write
+    /// failed.
+    fn persist_note(&self, id: Uuid) -> Option<Rc<SharedNote>> {
+        let shared = self.inner.notes.borrow().get(&id).cloned()?;
+        let body = shared.body.borrow().clone();
+        {
+            let mut note = shared.note.borrow_mut();
+            // For locked notes `body` is the encrypted blob: never derive
+            // a title from it.
+            if !note.is_locked {
+                note.title = Note::derive_title(&body);
+            }
+            if let Err(err) = self.inner.store.save(&mut note, &body) {
+                eprintln!("failed to save note {id}: {err}");
+                return None;
+            }
+        }
+        Some(shared)
     }
 
     /// (Re)start the coalesced auto-commit timer.
@@ -933,8 +1008,14 @@ impl App {
         *self.inner.commit_source.borrow_mut() = Some(source);
     }
 
-    /// Commit pending changes, if any.
+    /// Commit pending changes, if any. Serialized against the sync
+    /// thread: two concurrent `git` processes trip over `index.lock`.
+    /// Like [`App::commit_auto`], skipped mid-conflict.
     fn commit_now(&self) {
+        if self.inner.repo.has_conflicts().unwrap_or(false) {
+            return;
+        }
+        let _guard = self.inner.git_lock.lock().expect("git lock poisoned");
         if let Some(source) = self.inner.commit_source.borrow_mut().take() {
             cancel_source(source);
         }
@@ -964,6 +1045,22 @@ impl App {
                     .last_fired_at
                     .is_some_and(|last| last >= reminder.due_at);
                 if reminder.due_at <= now && !already {
+                    // Recurring reminders reschedule instead of going
+                    // quiet: advance past the present first, so the fired
+                    // record (and any later snooze of it) refers to the
+                    // upcoming occurrence rather than a due time that no
+                    // longer exists. Missed occurrences collapse into this
+                    // single firing rather than backlogging.
+                    if reminder.recurrence_rule != Recurrence::None {
+                        let mut due = reminder.due_at;
+                        for _ in 0..366 {
+                            due = reminder.recurrence_rule.next_after(due);
+                            if due > now {
+                                break;
+                            }
+                        }
+                        reminder.due_at = due;
+                    }
                     reminder.last_fired_at = Some(now);
                     fired.push((*id, reminder.due_at, title.clone()));
                     dirty = true;
@@ -1043,14 +1140,13 @@ impl App {
         }
     }
 
-    /// Add a one-shot reminder to a note.
-    fn add_reminder(&self, id: Uuid, due: DateTime<Utc>) {
+    /// Add a reminder to a note.
+    fn add_reminder(&self, id: Uuid, due: DateTime<Utc>, recurrence: Recurrence) {
         if let Some(shared) = self.inner.notes.borrow().get(&id) {
             shared.note.borrow_mut().reminders.push(Reminder {
                 due_at: due,
-                recurrence_rule: Recurrence::None,
+                recurrence_rule: recurrence,
                 last_fired_at: None,
-                snooze_count: 0,
             });
         }
         self.save_now(id);
@@ -1079,7 +1175,6 @@ impl App {
                 .find(|reminder| reminder.due_at == due)
                 .is_some_and(|reminder| {
                     reminder.due_at = Utc::now() + ChronoDuration::minutes(minutes);
-                    reminder.snooze_count += 1;
                     true
                 })
         };
@@ -1172,14 +1267,29 @@ impl App {
                         let this = self.clone();
                         move |value| {
                             this.set_setting(|settings| settings.enable_global_shortcut = value);
-                            // The GNOME fallback registers live; the
-                            // portal path binds at startup.
-                            if this.inner.shortcut_backend == ShortcutBackend::GnomeSettings {
-                                if value {
-                                    crate::gnome_shortcut::enable();
-                                } else {
-                                    crate::gnome_shortcut::disable();
+                            // The portal listener thread honors this gate
+                            // live; spawn it on first enable (it can only
+                            // be spawned once). The GNOME fallback
+                            // registers/unregisters live.
+                            this.inner.shortcut_gate.store(value, Ordering::SeqCst);
+                            match this.inner.shortcut_backend {
+                                ShortcutBackend::Portal => {
+                                    if value && !*this.inner.shortcut_spawned.borrow() {
+                                        crate::shortcuts::spawn(
+                                            this.inner.tx.clone(),
+                                            this.inner.shortcut_gate.clone(),
+                                        );
+                                        *this.inner.shortcut_spawned.borrow_mut() = true;
+                                    }
                                 }
+                                ShortcutBackend::GnomeSettings => {
+                                    if value {
+                                        crate::gnome_shortcut::enable();
+                                    } else {
+                                        crate::gnome_shortcut::disable();
+                                    }
+                                }
+                                ShortcutBackend::None => {}
                             }
                         }
                     }),
@@ -1239,23 +1349,16 @@ impl App {
                     }),
                     on_master_password: Box::new({
                         let this = self.clone();
-                        move |password| {
-                            {
-                                let mut state = this.inner.local_state.borrow_mut();
-                                state.master_password = password;
-                            }
-                            if let Err(err) = this
-                                .inner
-                                .local_state
-                                .borrow()
-                                .save(&this.inner.local_state_path)
-                            {
-                                eprintln!("failed to save local state: {err}");
-                            }
-                        }
+                        move |password| this.master_password_changed(password)
                     }),
                 },
             );
+            {
+                let this = self.clone();
+                window.connect_close(move || {
+                    this.inner.settings_window.borrow_mut().take();
+                });
+            }
             *self.inner.settings_window.borrow_mut() = Some(window);
         }
         if let Some(window) = self.inner.settings_window.borrow().as_ref() {
@@ -1270,9 +1373,10 @@ impl App {
         if enabled {
             let exe = std::env::current_exe()
                 .map_or_else(|_| "pinlet".to_owned(), |path| path.display().to_string());
+            // Quote the executable: install paths may contain spaces.
             let entry = format!(
                 "[Desktop Entry]\nType=Application\nName=Pinlet\n\
-                 Comment=Sticky notes for your desktop\nExec={exe}\n\
+                 Comment=Sticky notes for your desktop\nExec=\"{exe}\"\n\
                  Terminal=false\nX-GNOME-Autostart-enabled=true\n"
             );
             if let Err(err) =
@@ -1285,6 +1389,29 @@ impl App {
         {
             eprintln!("failed to remove autostart entry: {err}");
         }
+    }
+
+    /// Record a master-password change, persisting the local state
+    /// file after a short idle delay (the Preferences entry fires on
+    /// every keystroke; each save is an atomic rewrite).
+    fn master_password_changed(&self, password: String) {
+        self.inner.local_state.borrow_mut().master_password = password;
+        if let Some(source) = self.inner.master_pw_source.borrow_mut().take() {
+            cancel_source(source);
+        }
+        let this = self.clone();
+        let source = glib::timeout_add_local_once(Duration::from_secs(1), move || {
+            *this.inner.master_pw_source.borrow_mut() = None;
+            if let Err(err) = this
+                .inner
+                .local_state
+                .borrow()
+                .save(&this.inner.local_state_path)
+            {
+                eprintln!("failed to save local state: {err}");
+            }
+        });
+        *self.inner.master_pw_source.borrow_mut() = Some(source);
     }
 
     /// Mutate and persist one setting.
@@ -1312,14 +1439,28 @@ impl App {
         }
     }
 
+    /// Restyle one window per the color mode. Used when opening a
+    /// window, so startup stays linear instead of re-styling every
+    /// window for each note.
+    fn apply_color_for(&self, id: Uuid, window: &NoteWindow) {
+        let force = self.inner.settings.borrow().force_global_color;
+        let color = if force {
+            self.default_color()
+        } else if let Some(shared) = self.inner.notes.borrow().get(&id) {
+            shared.note.borrow().color.clone()
+        } else {
+            return;
+        };
+        window.apply_color(&color);
+    }
+
     /// Debounce window-geometry saves.
     fn geometry_changed(&self) {
         if let Some(source) = self.inner.geometry_source.borrow_mut().take() {
             cancel_source(source);
         }
         let this = self.clone();
-        let source =
-            glib::timeout_add_local_once(GEOMETRY_DEBOUNCE, move || this.save_geometry());
+        let source = glib::timeout_add_local_once(GEOMETRY_DEBOUNCE, move || this.save_geometry());
         *self.inner.geometry_source.borrow_mut() = Some(source);
     }
 
@@ -1334,19 +1475,15 @@ impl App {
             } else {
                 window.position_on_screen()
             };
-            self.inner
-                .local_state
-                .borrow_mut()
-                .window_geometry
-                .insert(
-                    id.to_string(),
-                    WindowGeometry {
-                        x: x as i32,
-                        y: y as i32,
-                        width: window.width(),
-                        height: window.height(),
-                    },
-                );
+            self.inner.local_state.borrow_mut().window_geometry.insert(
+                id.to_string(),
+                WindowGeometry {
+                    x: x as i32,
+                    y: y as i32,
+                    width: window.width(),
+                    height: window.height(),
+                },
+            );
         }
         if let Err(err) = self
             .inner
@@ -1358,13 +1495,30 @@ impl App {
         }
     }
 
-    /// Persist every note and commit before quitting.
+    /// Persist every note and commit before quitting. Files go out
+    /// one by one, but the tray refresh and the commit happen once.
     fn flush_all(&self) {
         let ids: Vec<Uuid> = self.inner.notes.borrow().keys().copied().collect();
         for id in ids {
-            self.save_now(id);
+            self.persist_note(id);
         }
+        if self.inner.commit_message.borrow().is_empty() {
+            *self.inner.commit_message.borrow_mut() = "Save all notes".to_owned();
+        }
+        self.refresh_tray_snapshot();
         self.save_geometry();
+        // A debounced master-password save may still be pending.
+        if let Some(source) = self.inner.master_pw_source.borrow_mut().take() {
+            cancel_source(source);
+        }
+        if let Err(err) = self
+            .inner
+            .local_state
+            .borrow()
+            .save(&self.inner.local_state_path)
+        {
+            eprintln!("failed to save local state: {err}");
+        }
         self.commit_now();
     }
 }
@@ -1387,6 +1541,12 @@ fn run_sync(repo: &GitRepo, url: &str, branch: &str, commit_message: &str) -> Sy
     // Pull fast-forwardable changes first; a failure here is expected on a
     // fresh remote (no branch yet) or a divergence, both handled below.
     let _ = repo.pull(branch);
+
+    // A conflict from a previous sync still waits in the tree: report
+    // it instead of failing the commit below and flapping to Error.
+    if matches!(repo.has_conflicts(), Ok(true)) {
+        return SyncState::Conflict;
+    }
 
     if let Err(err) = repo.commit_all(fallback) {
         return SyncState::Error(err.to_string());
@@ -1419,8 +1579,8 @@ fn sync_state_text(state: &SyncState) -> String {
 }
 
 /// The pinlet data directory: the XDG data dir + `pinlet`.
-pub fn data_dir() -> AppResult<PathBuf> {
-    Ok(glib::user_data_dir().join(DATA_DIR_NAME))
+pub fn data_dir() -> PathBuf {
+    glib::user_data_dir().join(DATA_DIR_NAME)
 }
 
 #[cfg(test)]
@@ -1486,13 +1646,19 @@ mod tests {
             .is_some_and(|shared| shared.note.borrow().is_pinned_to_desktop);
         assert!(pinned, "note should be marked pinned");
         let window = app.inner.windows.borrow().get(&id).unwrap().clone();
-        assert!(window.is_pinned(), "window should live on the desktop layer");
+        assert!(
+            window.is_pinned(),
+            "window should live on the desktop layer"
+        );
         assert!(
             window.is_layer_window() || window.is_desktop_window(),
             "window must be on a compositor layer or an X11 desktop window"
         );
         pump_main_loop(); // let the pinned window realize and map
-        assert!(window.window().is_visible(), "pinned window should be visible");
+        assert!(
+            window.window().is_visible(),
+            "pinned window should be visible"
+        );
 
         app.toggle_pin(id);
         let pinned = app
@@ -1503,7 +1669,10 @@ mod tests {
             .is_some_and(|shared| shared.note.borrow().is_pinned_to_desktop);
         assert!(!pinned, "note should be unpinned again");
         let window = app.inner.windows.borrow().get(&id).unwrap().clone();
-        assert!(!window.is_pinned(), "window should be a regular window again");
+        assert!(
+            !window.is_pinned(),
+            "window should be a regular window again"
+        );
 
         let _ = std::fs::remove_dir_all(&scratch);
     }
@@ -1521,7 +1690,12 @@ mod tests {
         gtk4::prelude::WidgetExt::realize(&window);
 
         // #4a4523, the yellow note's pinned foreground.
-        let expected = gtk4::gdk::RGBA::new(0x4a as f32 / 255.0, 0x45 as f32 / 255.0, 0x23 as f32 / 255.0, 1.0);
+        let expected = gtk4::gdk::RGBA::new(
+            0x4a as f32 / 255.0,
+            0x45 as f32 / 255.0,
+            0x23 as f32 / 255.0,
+            1.0,
+        );
         let resolved = view.style_context().color();
         assert!(
             (resolved.red() - expected.red()).abs() < 0.01
@@ -1566,10 +1740,12 @@ mod tests {
         let id = app.new_note(NoteColor::Yellow, "color me".to_owned());
         let window = app.inner.windows.borrow().get(&id).unwrap().clone();
 
-        // Walk to the palette swatches: titlebar → MenuButton →
-        // Popover → FlowBox → Buttons.
+        // Walk to the palette swatches: titlebar → color MenuButton →
+        // Popover → FlowBox → Buttons. Matched by tooltip: the header
+        // holds several menu buttons (reminders, color), and the first
+        // in tree order is not the color one.
         let header = window.window().titlebar().expect("titlebar");
-        let menu_button = find_menu_button(&header).expect("color menu button");
+        let menu_button = find_menu_button(&header, "Note color").expect("color menu button");
         let popover = menu_button.popover().expect("popover");
         let flow = popover
             .child()
@@ -1581,7 +1757,9 @@ mod tests {
         let mut child = flow.first_child();
         while let Some(widget) = child {
             if let Ok(wrapper) = widget.clone().downcast::<gtk4::FlowBoxChild>()
-                && let Some(button) = wrapper.child().and_then(|w| w.downcast::<gtk4::Button>().ok())
+                && let Some(button) = wrapper
+                    .child()
+                    .and_then(|w| w.downcast::<gtk4::Button>().ok())
             {
                 swatches.push(button);
             }
@@ -1630,14 +1808,17 @@ mod tests {
         }
     }
 
-    /// Depth-first search for the first MenuButton in a widget tree.
-    fn find_menu_button(widget: &gtk4::Widget) -> Option<gtk4::MenuButton> {
+    /// Depth-first search for the MenuButton with the given tooltip in
+    /// a widget tree.
+    fn find_menu_button(widget: &gtk4::Widget, tooltip: &str) -> Option<gtk4::MenuButton> {
         if let Ok(button) = widget.clone().downcast::<gtk4::MenuButton>() {
-            return Some(button);
+            if button.tooltip_text().as_deref() == Some(tooltip) {
+                return Some(button);
+            }
         }
         let mut child = widget.first_child();
         while let Some(next) = child {
-            if let Some(found) = find_menu_button(&next) {
+            if let Some(found) = find_menu_button(&next, tooltip) {
                 return Some(found);
             }
             child = next.next_sibling();

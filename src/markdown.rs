@@ -67,10 +67,18 @@ impl Style {
 
 impl Span {
     fn hide(start: usize, end: usize) -> Span {
-        Span { start, end, kind: SpanKind::Hide }
+        Span {
+            start,
+            end,
+            kind: SpanKind::Hide,
+        }
     }
     fn style(start: usize, end: usize, style: Style) -> Span {
-        Span { start, end, kind: SpanKind::Style(style) }
+        Span {
+            start,
+            end,
+            kind: SpanKind::Style(style),
+        }
     }
 }
 
@@ -112,15 +120,33 @@ fn compute_styles(text: &str) -> Vec<Span> {
             Event::Start(tag) => match tag {
                 Tag::Emphasis => {
                     spans.push(Span::hide(s, s + 1));
-                    stack.push(Active { style: Style::Italic, marker: s, delimiter: 1, content_start: None, content_end: None });
+                    stack.push(Active {
+                        style: Style::Italic,
+                        marker: s,
+                        delimiter: 1,
+                        content_start: None,
+                        content_end: None,
+                    });
                 }
                 Tag::Strong => {
                     spans.push(Span::hide(s, s + 2));
-                    stack.push(Active { style: Style::Bold, marker: s, delimiter: 2, content_start: None, content_end: None });
+                    stack.push(Active {
+                        style: Style::Bold,
+                        marker: s,
+                        delimiter: 2,
+                        content_start: None,
+                        content_end: None,
+                    });
                 }
                 Tag::Strikethrough => {
                     spans.push(Span::hide(s, s + 2));
-                    stack.push(Active { style: Style::Strike, marker: s, delimiter: 2, content_start: None, content_end: None });
+                    stack.push(Active {
+                        style: Style::Strike,
+                        marker: s,
+                        delimiter: 2,
+                        content_start: None,
+                        content_end: None,
+                    });
                 }
                 Tag::Link { .. } => stack.push(Active {
                     style: Style::Link,
@@ -266,9 +292,9 @@ fn compute_styles(text: &str) -> Vec<Span> {
     spans
 }
 
-/// Hide the pipe (`|`) and separator-row (`-`) characters of a table that
-/// fall outside any cell, so the table renders as aligned text rather than
-/// raw Markdown syntax.
+/// Hide the pipe (`|`), separator-row (`-`), and alignment-colon (`:`)
+/// characters of a table that fall outside any cell, so the table
+/// renders as aligned text rather than raw Markdown syntax.
 fn hide_table_syntax(
     spans: &mut Vec<Span>,
     text: &str,
@@ -277,9 +303,14 @@ fn hide_table_syntax(
     cells: &[(usize, usize)],
 ) {
     let bytes = text.as_bytes();
-    for i in start..end {
-        let b = bytes[i];
-        if (b == b'|' || b == b'-') && !cells.iter().any(|&(cs, ce)| i >= cs && i < ce) {
+    for (i, &b) in bytes
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(end.saturating_sub(start))
+    {
+        if (b == b'|' || b == b'-' || b == b':') && !cells.iter().any(|&(cs, ce)| i >= cs && i < ce)
+        {
             spans.push(Span::hide(i, i + 1));
         }
     }
@@ -328,7 +359,11 @@ fn emit_item_marker(
     if depth >= 2 {
         // `left-margin` is paragraph-level, so tagging any range inside the
         // item indents the whole paragraph.
-        spans.push(Span::style(content_start, content_end, Style::Indent(depth)));
+        spans.push(Span::style(
+            content_start,
+            content_end,
+            Style::Indent(depth),
+        ));
     }
     if content_start > item_start {
         spans.push(Span::style(item_start, content_start, Style::ListMarker));
@@ -358,9 +393,18 @@ impl MarkdownTags {
     fn new(table: &gtk4::TextTagTable) -> Self {
         let tags = MarkdownTags {
             bold: TextTag::builder().name("md-bold").weight(700).build(),
-            italic: TextTag::builder().name("md-italic").style(pango::Style::Italic).build(),
-            strike: TextTag::builder().name("md-strike").strikethrough(true).build(),
-            code: TextTag::builder().name("md-code").family("monospace").build(),
+            italic: TextTag::builder()
+                .name("md-italic")
+                .style(pango::Style::Italic)
+                .build(),
+            strike: TextTag::builder()
+                .name("md-strike")
+                .strikethrough(true)
+                .build(),
+            code: TextTag::builder()
+                .name("md-code")
+                .family("monospace")
+                .build(),
             link: TextTag::builder()
                 .name("md-link")
                 .underline(pango::Underline::Single)
@@ -385,7 +429,10 @@ impl MarkdownTags {
                 .left_margin(24)
                 .style(pango::Style::Italic)
                 .build(),
-            table: TextTag::builder().name("md-table").family("monospace").build(),
+            table: TextTag::builder()
+                .name("md-table")
+                .family("monospace")
+                .build(),
             marker: TextTag::builder().name("md-marker").invisible(true).build(),
             list_marker: TextTag::builder()
                 .name("md-list-marker")
@@ -394,8 +441,8 @@ impl MarkdownTags {
             list_indent: (0..6)
                 .map(|i| {
                     TextTag::builder()
-                        .name(&format!("md-indent-{i}"))
-                        .left_margin(24 * (i as i32 + 1))
+                        .name(format!("md-indent-{i}"))
+                        .left_margin(24 * (i + 1))
                         .build()
                 })
                 .collect(),
@@ -510,7 +557,7 @@ impl MarkdownStyler {
         if let Some(tag) = links.get(url) {
             return tag.clone();
         }
-        let tag = TextTag::builder().name(&format!("link:{url}")).build();
+        let tag = TextTag::builder().name(format!("link:{url}")).build();
         buffer.tag_table().add(&tag);
         links.insert(url.to_string(), tag.clone());
         tag
@@ -642,9 +689,9 @@ mod tests {
         // Code body styled monospace.
         assert!(a.contains(&(SpanKind::Style(Style::Code), "fn main() {}\n")));
         // Closing fence hidden (may or may not include the trailing newline).
-        assert!(a
-            .iter()
-            .any(|(kind, sub)| *kind == SpanKind::Hide && sub.starts_with("```") && !sub.contains("rust")));
+        assert!(a.iter().any(|(kind, sub)| *kind == SpanKind::Hide
+            && sub.starts_with("```")
+            && !sub.contains("rust")));
     }
 
     #[test]
@@ -690,9 +737,11 @@ mod tests {
         let spans = compute_styles(text);
         let a = annotated(text, &spans);
         assert!(a.contains(&(SpanKind::Style(Style::ListMarker), "- ")));
-        assert!(!spans
-            .iter()
-            .any(|span| matches!(span.kind, SpanKind::Style(Style::Indent(_)))));
+        assert!(
+            !spans
+                .iter()
+                .any(|span| matches!(span.kind, SpanKind::Style(Style::Indent(_))))
+        );
     }
 
     #[test]
@@ -726,5 +775,4 @@ mod tests {
         assert!(a.contains(&(SpanKind::Hide, "|")));
         assert!(a.contains(&(SpanKind::Hide, "-")));
     }
-
 }

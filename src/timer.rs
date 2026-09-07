@@ -8,7 +8,10 @@ use gtk4::glib::{self, SourceId};
 /// (`timeout_add_local_once` sources remove themselves after
 /// firing), so stale ids must be checked before removal.
 pub fn cancel_source(source: SourceId) {
-    if glib::MainContext::default().find_source_by_id(&source).is_some() {
+    if glib::MainContext::default()
+        .find_source_by_id(&source)
+        .is_some()
+    {
         source.remove();
     }
 }

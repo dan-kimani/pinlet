@@ -51,11 +51,11 @@ pub fn enable() {
     }
 
     if let Some(binding) = binding_settings() {
-        // Only fill in defaults on first creation — a re-enable
-        // keeps the user's customized combo.
-        if binding.string("command").is_empty() {
-            let _ = binding.set_string("command", &capture_command());
-        }
+        // The command always points at the current executable (it goes
+        // stale across reinstalls to a new path); the key combo itself
+        // is only defaulted on first creation so a re-enable keeps the
+        // user's customized binding.
+        let _ = binding.set_string("command", &capture_command());
         if binding.string("binding").is_empty() {
             let _ = binding.set_string("binding", DEFAULT_BINDING);
         }

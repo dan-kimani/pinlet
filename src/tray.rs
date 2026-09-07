@@ -70,16 +70,21 @@ fn render_icon(size: i32) -> Option<Icon> {
 pub fn install_icon() {
     let hicolor = gtk4::glib::user_data_dir().join("icons/hicolor");
     let dest = hicolor.join("scalable/apps/org.pinlet.Pinlet.svg");
+    // The icon only changes with the binary: skip the write (and the
+    // theme cache-bust below) when it's already in place.
+    if std::fs::read(&dest).is_ok_and(|current| current == ICON_SVG) {
+        return;
+    }
     if let Some(parent) = dest.parent() {
-        if let Err(err) = std::fs::create_dir_all(parent)
-            .and_then(|_| std::fs::write(&dest, ICON_SVG))
+        if let Err(err) =
+            std::fs::create_dir_all(parent).and_then(|_| std::fs::write(&dest, ICON_SVG))
         {
             eprintln!("failed to install app icon: {err}");
             return;
         }
     }
     // Drop the theme cache so GTK re-scans and notices the new icon.
-    let _ = std::fs::remove_file(hicolor.join(".icon-theme.cache"));
+    let _ = std::fs::remove_file(hicolor.join("icon-theme.cache"));
 }
 
 /// A short human label for how far in the future `due` is.
@@ -171,7 +176,12 @@ impl PinletTray {
             label,
             icon_name: "alarm-symbolic".to_owned(),
             submenu: vec![
-                Self::item("Open note", "document-open-symbolic", Msg::FocusNote(reminder.note), tx),
+                Self::item(
+                    "Open note",
+                    "document-open-symbolic",
+                    Msg::FocusNote(reminder.note),
+                    tx,
+                ),
                 MenuItem::Separator,
                 Self::item("Snooze 10 minutes", "alarm-symbolic", snooze(10), tx),
                 Self::item("Snooze 1 hour", "alarm-symbolic", snooze(60), tx),
@@ -226,10 +236,6 @@ impl Tray for PinletTray {
         "Pinlet".to_owned()
     }
 
-    fn activate(&mut self, _x: i32, _y: i32) {
-        let _ = self.tx.send(Msg::ToggleAll);
-    }
-
     /// Overriding this signals ksni to rebuild the menu on every show, so
     /// the reminder list stays current. (The snapshot itself is refreshed
     /// by the app core whenever notes or reminders change.)
@@ -238,11 +244,25 @@ impl Tray for PinletTray {
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let mut items = Vec::new();
 
-        items.push(Self::item("New note", "list-add-symbolic", Msg::NewNote, &self.tx));
-        items.push(Self::item("Show / hide all", "view-restore-symbolic", Msg::ToggleAll, &self.tx));
+        items.push(Self::item(
+            "New note",
+            "list-add-symbolic",
+            Msg::NewNote,
+            &self.tx,
+        ));
+        items.push(Self::item(
+            "Show / hide all",
+            "view-restore-symbolic",
+            Msg::ToggleAll,
+            &self.tx,
+        ));
 
         // Sync status: pull → commit → push on click (spec §3.1).
-        let snapshot = self.snapshot.lock().expect("tray snapshot poisoned").clone();
+        let snapshot = self
+            .snapshot
+            .lock()
+            .expect("tray snapshot poisoned")
+            .clone();
         items.push(MenuItem::Separator);
         items.push(Self::sync_item(&snapshot.sync, &self.tx));
 
@@ -261,7 +281,12 @@ impl Tray for PinletTray {
             Msg::OpenSettings,
             &self.tx,
         ));
-        items.push(Self::item("Quit", "application-exit-symbolic", Msg::Quit, &self.tx));
+        items.push(Self::item(
+            "Quit",
+            "application-exit-symbolic",
+            Msg::Quit,
+            &self.tx,
+        ));
         items
     }
 }

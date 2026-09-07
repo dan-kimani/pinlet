@@ -18,10 +18,7 @@ fn main() -> glib::ExitCode {
     let cli = cli::Cli::parse();
 
     if matches!(&cli.command, Some(cli::Command::Where)) {
-        match app::data_dir() {
-            Ok(dir) => println!("{}", dir.display()),
-            Err(err) => eprintln!("failed to resolve data directory: {err}"),
-        }
+        println!("{}", app::data_dir().display());
         return glib::ExitCode::SUCCESS;
     }
 
@@ -40,15 +37,13 @@ fn main() -> glib::ExitCode {
             .into_iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        // GtkApplication may include the program name as argv[0];
-        // `try_parse_from` expects argv[0] to be present, so strip
-        // the real program name and prepend a placeholder.
-        let filtered: Vec<String> = args
-            .into_iter()
-            .filter(|arg| !arg.ends_with("/pinlet"))
-            .collect();
+        // GApplication always delivers the program name as argv[0];
+        // `try_parse_from` expects its own argv[0], so drop whatever
+        // arrived and prepend a placeholder, keeping the rest verbatim.
+        let mut remote_args = args.into_iter();
+        remote_args.next();
         let remote_cli =
-            cli::Cli::try_parse_from(std::iter::once("pinlet".to_owned()).chain(filtered))
+            cli::Cli::try_parse_from(std::iter::once("pinlet".to_owned()).chain(remote_args))
                 .unwrap_or(cli::Cli { command: None });
 
         // Clone the handle out of the slot first — the slot borrow
