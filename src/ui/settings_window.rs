@@ -46,7 +46,7 @@ pub struct SettingsCallbacks {
 }
 
 /// The six palette colors, in palette order.
-pub const COLOR_NAMES: [&str; 6] = ["Yellow", "Green", "Blue", "Pink", "Purple", "Charcoal"];
+const COLOR_NAMES: [&str; 6] = ["Yellow", "Green", "Blue", "Pink", "Purple", "Charcoal"];
 
 /// Auto-save debounce presets, in milliseconds.
 const SAVE_DELAYS_MS: [u64; 4] = [500, 1000, 2000, 5000];
@@ -349,15 +349,22 @@ impl SettingsWindow {
 
         window.add(&page);
 
-        Self {
-            window,
-            git_status,
-        }
+        Self { window, git_status }
     }
 
     /// Update the git status line after a push or pull.
     pub fn set_git_status(&self, message: &str) {
         self.git_status.set_label(message);
+    }
+
+    /// Run `f` when the window is closed, so the app core can drop its
+    /// handle — otherwise a closed Preferences window could never be
+    /// reopened.
+    pub fn connect_close(&self, f: impl Fn() + 'static) {
+        self.window.connect_close_request(move |_| {
+            f();
+            gtk4::glib::Propagation::Proceed
+        });
     }
 
     /// Show and focus the window.
@@ -376,7 +383,10 @@ fn selected_index(default_color: &str) -> u32 {
 
 /// Index of `ms` in the auto-save presets, falling back to the first.
 fn save_delay_index(ms: u64) -> u32 {
-    SAVE_DELAYS_MS.iter().position(|&value| value == ms).unwrap_or(0) as u32
+    SAVE_DELAYS_MS
+        .iter()
+        .position(|&value| value == ms)
+        .unwrap_or(0) as u32
 }
 
 /// Index of `minutes` in the sync interval presets, falling back to Off.

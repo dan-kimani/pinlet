@@ -41,6 +41,11 @@ pub fn foreground_for(bg_hex: &str) -> &'static str {
     }
 }
 
+/// Whether `hex` is a usable `#RRGGBB` color for generated CSS.
+pub fn is_valid_hex(hex: &str) -> bool {
+    parse_hex(hex).is_some()
+}
+
 /// Parse `#RRGGBB` into components.
 fn parse_hex(hex: &str) -> Option<(u8, u8, u8)> {
     let digits = hex.strip_prefix('#')?;

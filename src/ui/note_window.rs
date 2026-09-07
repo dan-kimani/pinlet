@@ -19,7 +19,7 @@ use gtk4::{
 };
 
 use crate::app::SharedNote;
-use crate::markdown::{source_to_preview, MarkdownStyler};
+use crate::markdown::{MarkdownStyler, source_to_preview};
 use crate::pinning::PinBackend;
 use crate::storage::{NoteColor, Recurrence, Reminder, WindowGeometry};
 use crate::ui::colors;
@@ -27,6 +27,14 @@ use crate::ui::reminder_dialog;
 
 /// Stylesheet shared by every note window.
 pub const STYLE: &str = include_str!("style.css");
+
+/// Click position in buffer coordinates for `TextView::iter_at_location`.
+/// Gesture handlers report widget coordinates, but hit-testing wants
+/// buffer coordinates — the two diverge by the scroll offset, so without
+/// this a click lands above the intended spot in any scrolled note.
+fn buffer_coords(view: &TextView, x: f64, y: f64) -> Option<(i32, i32)> {
+    Some(view.window_to_buffer_coords(gtk4::TextWindowType::Text, x as i32, y as i32))
+}
 
 /// Whether the Ctrl modifier is currently held. Read from the given display's
 /// keyboard rather than the event state, so it also works on the X11 desktop
@@ -52,8 +60,8 @@ pub struct NoteCallbacks {
     pub on_new: Box<dyn Fn()>,
     /// The window is closing (flush pending state).
     pub on_close: Box<dyn Fn()>,
-    /// The user picked a due time for a new reminder.
-    pub on_add_reminder: Box<dyn Fn(DateTime<Utc>)>,
+    /// The user picked a due time and repetition for a new reminder.
+    pub on_add_reminder: Box<dyn Fn(DateTime<Utc>, Recurrence)>,
     /// The user removed reminder `index`.
     pub on_delete_reminder: Box<dyn Fn(usize)>,
     /// The window was resized or moved (debounced geometry save).
@@ -76,8 +84,11 @@ pub struct NoteWindow {
     /// Position of a pinned window — layer-shell margins, or the
     /// tracked X11 position — updated while dragging.
     margins: Rc<Cell<(i32, i32)>>,
-    /// Kept alive so a custom hex color stays applied.
-    _custom_css: Option<gtk4::CssProvider>,
+    /// Dynamic provider for a custom hex color, swapped by
+    /// [`NoteWindow::apply_color`]. Kept alive so the styling stays
+    /// applied. Shared with the palette swatches (via `Rc`) so leaving
+    /// a custom color also removes its display-wide rules.
+    custom_css: Rc<RefCell<Option<gtk4::CssProvider>>>,
 }
 
 impl NoteWindow {
@@ -125,8 +136,6 @@ impl NoteWindow {
                 .build()
                 .upcast()
         };
-        window.set_css_classes(&[color.css_class()]);
-
         if x11_desktop {
             let (left, top) = margins.get();
             window.connect_realize(move |window| {
@@ -156,13 +165,17 @@ impl NoteWindow {
         // lean: an empty title widget suppresses the header's built-in title.
         header.set_title_widget(Some(&Label::new(None)));
 
-
         let new_btn = Button::from_icon_name("list-add-symbolic");
         new_btn.set_tooltip_text(Some("New note"));
         {
             let callbacks = callbacks.clone();
             new_btn.connect_clicked(move |_| (callbacks.on_new)());
         }
+
+        // Dynamic custom-color provider, shared with the palette swatches
+        // below so switching away from a custom color also removes the
+        // stale display-wide rules it installed.
+        let custom_css = Rc::new(RefCell::new(None));
 
         // Inline color palette: a popover of swatches. Each swatch is a flat
         // Button wrapping a colored Box — the Box renders the color reliably
@@ -191,9 +204,18 @@ impl NoteWindow {
                 let window = window.clone();
                 let callbacks = callbacks.clone();
                 let swatch_color = swatch_color.clone();
+                let custom_css = custom_css.clone();
                 swatch.connect_clicked(move |_| {
                     shared.note.borrow_mut().color = swatch_color.clone();
-                    window.set_css_classes(&[swatch_color.css_class()]);
+                    // Route through the shared helper (not a bare class
+                    // swap) so a previous custom color's provider is
+                    // removed from the display.
+                    apply_color_to(
+                        &window,
+                        color_display(&window, x11_desktop),
+                        &custom_css,
+                        &swatch_color,
+                    );
                     // Clone the body and drop the borrow before calling
                     // out: on_changed writes back into `shared.body`.
                     let body = shared.body.borrow().clone();
@@ -218,10 +240,7 @@ impl NoteWindow {
             let window = window.clone();
             reminders_popover.connect_show(move |popover| {
                 popover.set_child(Some(&build_reminders_popover(
-                    &shared,
-                    &callbacks,
-                    &window,
-                    popover,
+                    &shared, &callbacks, &window, popover,
                 )));
             });
         }
@@ -281,11 +300,7 @@ impl NoteWindow {
         // Locking (spec §3.10).
         let locked = shared.note.borrow().is_locked;
         let lock_btn = Button::from_icon_name("system-lock-screen-symbolic");
-        lock_btn.set_tooltip_text(Some(if locked {
-            "Unlock note"
-        } else {
-            "Lock note"
-        }));
+        lock_btn.set_tooltip_text(Some(if locked { "Unlock note" } else { "Lock note" }));
         {
             let callbacks = callbacks.clone();
             lock_btn.connect_clicked(move |_| (callbacks.on_lock_requested)());
@@ -368,8 +383,10 @@ impl NoteWindow {
                     let drag_start = drag_start.clone();
                     drag.connect_drag_update(move |_gesture, dx, dy| {
                         let (start_left, start_top) = drag_start.get();
-                        let left = start_left + dx as i32;
-                        let top = start_top + dy as i32;
+                        // Margins are unsigned on the wire: clamp rather
+                        // than push the window into protocol-error limbo.
+                        let left = (start_left + dx as i32).max(0);
+                        let top = (start_top + dy as i32).max(0);
                         window.set_margin(Edge::Left, left);
                         window.set_margin(Edge::Top, top);
                         margins.set((left, top));
@@ -405,7 +422,7 @@ impl NoteWindow {
             .cursor_visible(false)
             .build();
         preview_view.add_css_class("pinlet-body");
-        let styler = MarkdownStyler::new(&preview_view.buffer());
+        let styler = Rc::new(MarkdownStyler::new(&preview_view.buffer()));
 
         // Open links in the default handler on Ctrl+click, and show a pointer
         // cursor while hovering a link.
@@ -416,7 +433,10 @@ impl NoteWindow {
                 if n_press != 1 || !ctrl_held(&view.display()) {
                     return;
                 }
-                let Some(iter) = view.iter_at_location(x as i32, y as i32) else {
+                let Some((bx, by)) = buffer_coords(&view, x, y) else {
+                    return;
+                };
+                let Some(iter) = view.iter_at_location(bx, by) else {
                     return;
                 };
                 for tag in iter.tags() {
@@ -424,8 +444,8 @@ impl NoteWindow {
                     let Some(url) = name.as_str().strip_prefix("link:") else {
                         continue;
                     };
-                    let context = gtk4::gdk::Display::default()
-                        .map(|display| display.app_launch_context());
+                    let context =
+                        gtk4::gdk::Display::default().map(|display| display.app_launch_context());
                     if let Err(err) =
                         gtk4::gio::AppInfo::launch_default_for_uri(url, context.as_ref())
                     {
@@ -441,17 +461,49 @@ impl NoteWindow {
         {
             let view = preview_view.clone();
             link_hover.connect_motion(move |_controller, x, y| {
-                let over_link = view
-                    .iter_at_location(x as i32, y as i32)
+                let over_link = buffer_coords(&view, x, y)
+                    .and_then(|(bx, by)| view.iter_at_location(bx, by))
                     .is_some_and(|iter| {
-                        iter.tags().iter().any(|tag| {
-                            tag.name().is_some_and(|n| n.as_str().starts_with("link:"))
-                        })
+                        iter.tags()
+                            .iter()
+                            .any(|tag| tag.name().is_some_and(|n| n.as_str().starts_with("link:")))
                     });
                 view.set_cursor_from_name(over_link.then_some("pointer"));
             });
         }
         preview_view.add_controller(link_hover);
+
+        // Clicking a checkbox in the preview toggles the matching task
+        // item in the editable source (preview line N is source line N:
+        // the checkbox transform never adds or removes newlines). The
+        // edit goes through the normal change → debounced-save path.
+        let checkbox_click = gtk4::GestureClick::new();
+        // Left button only: middle/right presses keep their default
+        // behavior (paste, context menu).
+        checkbox_click.set_button(gdk::BUTTON_PRIMARY);
+        {
+            let edit_view = edit_view.clone();
+            let preview_view = preview_view.clone();
+            let styler = styler.clone();
+            checkbox_click.connect_pressed(move |gesture, n_press, x, y| {
+                // Ctrl+click is the link gesture; locked notes show no
+                // checkboxes anyway (the glyph hit-test would miss).
+                if n_press != 1 || locked || ctrl_held(&preview_view.display()) {
+                    return;
+                }
+                let Some((bx, by)) = buffer_coords(&preview_view, x, y) else {
+                    return;
+                };
+                let Some(iter) = preview_view.iter_at_location(bx, by) else {
+                    return;
+                };
+                if toggle_checkbox_at(&edit_view, &preview_view, &iter) {
+                    gesture.set_state(gtk4::EventSequenceState::Claimed);
+                    refresh_preview(&edit_view, &preview_view, &styler);
+                }
+            });
+        }
+        preview_view.add_controller(checkbox_click);
 
         if locked {
             edit_view.set_editable(false);
@@ -486,21 +538,12 @@ impl NoteWindow {
             let edit_view = edit_view.clone();
             let preview_view = preview_view.clone();
             let stack = stack.clone();
+            let styler = styler.clone();
             preview_toggle.connect_toggled(move |button| {
                 if button.is_active() {
                     button.set_icon_name("view-reveal-symbolic");
                     button.set_tooltip_text(Some("Edit"));
-                    let source = edit_view
-                        .buffer()
-                        .text(
-                            &edit_view.buffer().start_iter(),
-                            &edit_view.buffer().end_iter(),
-                            true,
-                        )
-                        .to_string();
-                    let preview = source_to_preview(&source);
-                    preview_view.buffer().set_text(&preview);
-                    styler.restyle(&preview_view.buffer());
+                    refresh_preview(&edit_view, &preview_view, &styler);
                     stack.set_visible_child(&preview_view);
                 } else {
                     button.set_icon_name("view-conceal-symbolic");
@@ -517,19 +560,23 @@ impl NoteWindow {
         }
 
         // Drag & drop appends to the editor (which holds the editable
-        // source), turning file URIs into Markdown links.
-        let drop_target = gtk4::DropTarget::new(glib::Type::STRING, gdk::DragAction::COPY);
-        {
-            let buffer = edit_view.buffer();
-            drop_target.connect_drop(move |_target, value, _x, _y| {
-                if let Ok(text) = value.get::<String>() {
-                    append_drop(&buffer, &text);
-                    return true;
-                }
-                false
-            });
+        // source), turning file URIs into Markdown links. Locked notes
+        // show a placeholder, never the body — a drop must not rewrite
+        // their encrypted blob with placeholder text.
+        if !locked {
+            let drop_target = gtk4::DropTarget::new(glib::Type::STRING, gdk::DragAction::COPY);
+            {
+                let buffer = edit_view.buffer();
+                drop_target.connect_drop(move |_target, value, _x, _y| {
+                    if let Ok(text) = value.get::<String>() {
+                        append_drop(&buffer, &text);
+                        return true;
+                    }
+                    false
+                });
+            }
+            edit_view.add_controller(drop_target);
         }
-        edit_view.add_controller(drop_target);
 
         let scroller = ScrolledWindow::builder()
             .child(&stack)
@@ -542,23 +589,6 @@ impl NoteWindow {
 
         window.set_titlebar(Some(&header));
         window.set_child(Some(&content));
-
-        // A custom hex color needs a dynamic provider.
-        let custom_css = match &color {
-            NoteColor::Custom(hex) => {
-                let provider = gtk4::CssProvider::new();
-                provider.load_from_data(&colors::css_for_custom(hex));
-                if let Some(display) = gtk4::gdk::Display::default() {
-                    gtk4::style_context_add_provider_for_display(
-                        &display,
-                        &provider,
-                        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-                    );
-                }
-                Some(provider)
-            }
-            _ => None,
-        };
 
         // Geometry: notify the app core (debounced there) whenever
         // the window is resized.
@@ -579,13 +609,21 @@ impl NoteWindow {
             });
         }
 
-        Self {
+        // The X11 desktop window lives on a different display than the
+        // default one, and the surface may not exist yet — resolve the
+        // right display up front so a custom color lands correctly.
+        let initial_display = x11_display.or_else(gdk::Display::default);
+        let this = Self {
             window,
             pinned,
             x11_desktop,
             margins,
-            _custom_css: custom_css,
-        }
+            custom_css,
+        };
+        // Route through the shared helper so named and custom hex colors
+        // share one path (custom colors need a dynamic provider).
+        apply_color_to(&this.window, initial_display, &this.custom_css, &color);
+        this
     }
 
     /// Show and focus the window.
@@ -594,9 +632,16 @@ impl NoteWindow {
     }
 
     /// Restyle the window with `color` (spec Mode B applies a global
-    /// color without changing the note's stored color).
+    /// color without changing the note's stored color). Custom hex
+    /// colors need a dynamic CSS provider: the previous one is removed
+    /// from the display so stale rules don't pile up.
     pub fn apply_color(&self, color: &NoteColor) {
-        self.window.set_css_classes(&[color.css_class()]);
+        apply_color_to(
+            &self.window,
+            color_display(&self.window, self.x11_desktop),
+            &self.custom_css,
+            color,
+        );
     }
 
     /// The underlying window (for dialogs parented to this note).
@@ -671,6 +716,51 @@ impl NoteWindow {
     }
 }
 
+/// Display a window's styling belongs to: its own surface's display
+/// when realized (X11 desktop windows live on a different display
+/// than the default), falling back to the default display and then
+/// the cached X11 display.
+fn color_display(window: &gtk4::Window, x11_desktop: bool) -> Option<gdk::Display> {
+    window
+        .surface()
+        .map(|surface| surface.display())
+        .or_else(gdk::Display::default)
+        .or_else(|| if x11_desktop { x11::display() } else { None })
+}
+
+/// (Re)style a window: set its palette class and swap the dynamic
+/// custom-color provider, removing the previous one so stale rules
+/// never pile up on the display. Malformed custom colors install no
+/// provider (the palette class alone still applies).
+fn apply_color_to(
+    window: &gtk4::Window,
+    display: Option<gdk::Display>,
+    slot: &RefCell<Option<gtk4::CssProvider>>,
+    color: &NoteColor,
+) {
+    window.set_css_classes(&[color.css_class()]);
+    let mut slot = slot.borrow_mut();
+    if let Some(old) = slot.take() {
+        if let Some(display) = display.as_ref() {
+            gtk4::style_context_remove_provider_for_display(display, &old);
+        }
+    }
+    if let NoteColor::Custom(hex) = color {
+        if colors::is_valid_hex(hex) {
+            let provider = gtk4::CssProvider::new();
+            provider.load_from_data(&colors::css_for_custom(hex));
+            if let Some(display) = display.as_ref() {
+                gtk4::style_context_add_provider_for_display(
+                    display,
+                    &provider,
+                    gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+                );
+            }
+            *slot = Some(provider);
+        }
+    }
+}
+
 /// Build the reminder popover content fresh (called on every show).
 fn build_reminders_popover(
     shared: &Rc<SharedNote>,
@@ -719,10 +809,7 @@ fn build_reminders_popover(
                         (callbacks.on_delete_reminder)(index);
                         // Rebuild the list in place so the deletion is visible.
                         popover.set_child(Some(&build_reminders_popover(
-                            &shared,
-                            &callbacks,
-                            &window,
-                            &popover,
+                            &shared, &callbacks, &window, &popover,
                         )));
                     }
                     dialog.close();
@@ -752,7 +839,9 @@ fn build_reminders_popover(
         let window = window.clone();
         add.connect_clicked(move |_| {
             let callbacks = callbacks.clone();
-            reminder_dialog::present(&window, move |due| (callbacks.on_add_reminder)(due));
+            reminder_dialog::present(&window, move |due, recurrence| {
+                (callbacks.on_add_reminder)(due, recurrence)
+            });
         });
     }
     content.append(&add);
@@ -779,9 +868,10 @@ fn append_drop(buffer: &TextBuffer, text: &str) {
         .lines()
         .map(|line| {
             if line.starts_with("file://") {
+                let lower = line.to_ascii_lowercase();
                 let is_image = [".png", ".jpg", ".jpeg", ".svg", ".webp"]
                     .iter()
-                    .any(|ext| line.ends_with(ext));
+                    .any(|ext| lower.ends_with(ext));
                 if is_image {
                     format!("![image]({line})")
                 } else {
@@ -806,4 +896,150 @@ fn append_drop(buffer: &TextBuffer, text: &str) {
     buffer.end_user_action();
     let end = buffer.end_iter();
     buffer.place_cursor(&end);
+}
+
+/// Re-render the preview view from the edit buffer's current source.
+fn refresh_preview(edit_view: &TextView, preview_view: &TextView, styler: &MarkdownStyler) {
+    let buffer = edit_view.buffer();
+    let source = buffer
+        .text(&buffer.start_iter(), &buffer.end_iter(), true)
+        .to_string();
+    let preview = source_to_preview(&source);
+    preview_view.buffer().set_text(&preview);
+    styler.restyle(&preview_view.buffer());
+}
+
+/// Toggle the task item on the source line matching the preview
+/// position `at`. Returns true when a checkbox flipped: the preview
+/// position must sit on a `☐`/`☑` glyph (placeholders and literal
+/// brackets in code blocks have none), and the source line must carry
+/// the corresponding marker.
+fn toggle_checkbox_at(edit_view: &TextView, preview_view: &TextView, at: &gtk4::TextIter) -> bool {
+    // Glyph under the cursor?
+    let preview = preview_view.buffer();
+    let Some(line_start) = preview.iter_at_line(at.line()) else {
+        return false;
+    };
+    let mut line_end = line_start;
+    line_end.forward_to_line_end();
+    let line_text = preview.text(&line_start, &line_end, true).to_string();
+    // Forgiving hit area: the glyph plus one character of slack on each
+    // side, so the whole checkbox region (not just the exact glyph)
+    // picks up the click. The glyph must still lead the line (past
+    // indentation) — a `☐` typed literally inside task text is not a
+    // checkbox.
+    let idx = at.line_offset() as usize;
+    let mut checked = None;
+    for (n, (b, c)) in line_text.char_indices().enumerate() {
+        if c != '☐' && c != '☑' {
+            continue;
+        }
+        if !line_text[..b].trim().is_empty() || idx.abs_diff(n) > 1 {
+            return false;
+        }
+        checked = Some(c == '☑');
+        break;
+    }
+    let Some(checked) = checked else {
+        return false;
+    };
+
+    // Same line in the editable source: flip its task marker in place
+    // (one undo step), which fires the normal change → save path.
+    let edit = edit_view.buffer();
+    let Some(start) = edit.iter_at_line(at.line()) else {
+        return false;
+    };
+    let mut end = start;
+    end.forward_to_line_end();
+    let src = edit.text(&start, &end, true).to_string();
+    let Some((byte, _len)) = find_checkbox(&src) else {
+        return false;
+    };
+    let col = src[..byte].chars().count() as i32;
+    let replacement = if checked { "[ ]" } else { "[x]" };
+    let mut rs = start;
+    rs.forward_chars(col);
+    let mut re = rs;
+    re.forward_chars(3);
+    edit.begin_user_action();
+    edit.delete(&mut rs, &mut re);
+    edit.insert(&mut rs, replacement);
+    edit.end_user_action();
+    true
+}
+
+/// Byte offset of the task-list marker on a source line: the
+/// `[ ]`/`[x]`/`[X]` following the list bullet, or the first such
+/// bracket group when the bullet doesn't parse (defensive: the
+/// preview glyph proves a real task item produced this line).
+fn find_checkbox(line: &str) -> Option<(usize, usize)> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    // Skip `-`, `*`, `+`, or an ordered-list marker (`1.` / `1)`).
+    if i < bytes.len() && matches!(bytes[i], b'-' | b'*' | b'+') {
+        i += 1;
+    } else {
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == start || i >= bytes.len() || !matches!(bytes[i], b'.' | b')') {
+            return first_bracket_group(line);
+        }
+        i += 1;
+    }
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    if is_checkbox_at(bytes, i) {
+        return Some((i, 3));
+    }
+    first_bracket_group(line)
+}
+
+/// `[` + space/`x`/`X` + `]` at byte offset `i`?
+fn is_checkbox_at(bytes: &[u8], i: usize) -> bool {
+    bytes.len() >= i + 3
+        && bytes[i] == b'['
+        && matches!(bytes[i + 1], b' ' | b'x' | b'X')
+        && bytes[i + 2] == b']'
+}
+
+/// First `[ ]`/`[x]`/`[X]` group anywhere (fallback for exotic
+/// bullets; the preview glyph proves a task item is on this line).
+fn first_bracket_group(line: &str) -> Option<(usize, usize)> {
+    let bytes = line.as_bytes();
+    (0..bytes.len())
+        .find(|&i| is_checkbox_at(bytes, i))
+        .map(|i| (i, 3))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_checkbox;
+
+    #[test]
+    fn checkbox_found_after_bullets() {
+        assert_eq!(find_checkbox("- [ ] task"), Some((2, 3)));
+        assert_eq!(find_checkbox("- [x] done"), Some((2, 3)));
+        assert_eq!(find_checkbox("  * [X] star"), Some((4, 3)));
+        assert_eq!(find_checkbox("1. [ ] ordered"), Some((3, 3)));
+        assert_eq!(find_checkbox("12) [x] paren"), Some((4, 3)));
+    }
+
+    #[test]
+    fn checkbox_prefers_marker_over_later_brackets() {
+        assert_eq!(find_checkbox("- [ ] a [x] b"), Some((2, 3)));
+    }
+
+    #[test]
+    fn checkbox_missing_without_marker() {
+        assert_eq!(find_checkbox("no box here"), None);
+        assert_eq!(find_checkbox("- just a dash"), None);
+        assert_eq!(find_checkbox(""), None);
+    }
 }

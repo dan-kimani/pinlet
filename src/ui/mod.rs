@@ -12,8 +12,8 @@ pub use settings_window::{SettingsCallbacks, SettingsWindow};
 
 use std::cell::RefCell;
 
-use gtk4::gdk;
 use gtk4::CssProvider;
+use gtk4::gdk;
 
 use note_window::STYLE;
 
@@ -26,17 +26,17 @@ pub fn ensure_styles() {
     }
     PROVIDER.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let provider = slot.get_or_insert_with(|| {
+        if slot.is_none() {
             let provider = CssProvider::new();
             provider.load_from_data(STYLE);
-            provider
-        });
-        if let Some(display) = gdk::Display::default() {
-            gtk4::style_context_add_provider_for_display(
-                &display,
-                provider,
-                gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-            );
+            if let Some(display) = gdk::Display::default() {
+                gtk4::style_context_add_provider_for_display(
+                    &display,
+                    &provider,
+                    gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+                );
+            }
+            *slot = Some(provider);
         }
     });
 }
