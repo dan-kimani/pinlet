@@ -8,7 +8,7 @@ use adw::{
     ActionRow, ComboRow, EntryRow, PreferencesGroup, PreferencesPage, PreferencesWindow, SwitchRow,
 };
 use gtk4::gio;
-use gtk4::{Label, Orientation, PasswordEntry, SignalListItemFactory};
+use gtk4::{Button, Label, Orientation, PasswordEntry, SignalListItemFactory};
 
 use crate::settings::Settings;
 use crate::storage::NoteColor;
@@ -41,8 +41,10 @@ pub struct SettingsCallbacks {
     pub on_git_pull: Box<dyn Fn()>,
     /// Push the note repo to its remote.
     pub on_git_push: Box<dyn Fn()>,
-    /// Master password changed.
-    pub on_master_password: Box<dyn Fn(String)>,
+    /// Master password Set button pressed with the entry contents
+    /// (empty clears the stored secret). Returns `Ok` on success so
+    /// the UI can reflect the new state, `Err` message otherwise.
+    pub on_master_password: Box<dyn Fn(String) -> Result<(), String>>,
 }
 
 /// The six palette colors, in palette order.
@@ -75,7 +77,7 @@ impl SettingsWindow {
         app: &gtk4::Application,
         settings: &Settings,
         data_dir: PathBuf,
-        master_password: &str,
+        has_master_password: bool,
         shortcut_support: bool,
         shortcut_subtitle: &'static str,
         callbacks: SettingsCallbacks,
@@ -203,21 +205,45 @@ impl SettingsWindow {
         storage_group.add(&data_row);
         page.add(&storage_group);
 
+        // The secret itself lives in the system keyring, never on disk:
+        // the entry only ever holds a replacement candidate, committed
+        // explicitly with Set (per-keystroke writes would store
+        // half-typed passwords, and prefilling would leak the secret
+        // into the widget).
         let security_group = PreferencesGroup::builder().title("Security").build();
         let password_row = ActionRow::builder()
             .title("Master password")
-            .subtitle("Used to lock and unlock notes")
+            .subtitle(password_subtitle(has_master_password))
             .build();
         let password_entry = PasswordEntry::builder()
             .show_peek_icon(true)
             .hexpand(true)
+            .placeholder_text("New master password")
             .build();
-        password_entry.set_text(master_password);
-        password_row.add_suffix(&password_entry);
+        let set_password_btn = Button::builder()
+            .label("Set")
+            .tooltip_text("Store this password (empty clears the stored one)")
+            .build();
+        let password_box = gtk4::Box::new(Orientation::Horizontal, 8);
+        password_box.append(&password_entry);
+        password_box.append(&set_password_btn);
+        password_row.add_suffix(&password_box);
         {
             let callbacks = callbacks.clone();
-            password_entry.connect_changed(move |entry| {
-                (callbacks.on_master_password)(entry.text().to_string());
+            let password_row = password_row.clone();
+            set_password_btn.connect_clicked(move |_| {
+                let password = password_entry.text().to_string();
+                // Empty means "clear the stored secret".
+                let storing = !password.is_empty();
+                match (callbacks.on_master_password)(password) {
+                    Ok(()) => {
+                        password_entry.set_text("");
+                        password_row.set_subtitle(password_subtitle(storing));
+                    }
+                    Err(err) => {
+                        password_row.set_subtitle(&format!("Could not store it: {err}"));
+                    }
+                }
             });
         }
         security_group.add(&password_row);
@@ -370,6 +396,16 @@ impl SettingsWindow {
     /// Show and focus the window.
     pub fn present(&self) {
         self.window.present();
+    }
+}
+
+/// Status line for the master-password row, always reflecting whether
+/// a secret is stored.
+fn password_subtitle(set: bool) -> &'static str {
+    if set {
+        "Set — stored in the system keyring. Entering a new one replaces it."
+    } else {
+        "Not set — stored in the system keyring, never on disk."
     }
 }
 

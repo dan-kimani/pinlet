@@ -120,9 +120,6 @@ struct AppInner {
     /// Machine-local state (git-ignored).
     local_state: RefCell<LocalState>,
     local_state_path: PathBuf,
-    /// Pending debounced master-password save (the Preferences entry
-    /// fires on every keystroke).
-    master_pw_source: RefCell<Option<SourceId>>,
     /// Drain timer for the background message channel.
     msg_source: RefCell<Option<SourceId>>,
     /// Sender side of the background message channel.
@@ -250,7 +247,6 @@ impl App {
             geometry_source: RefCell::new(None),
             local_state: RefCell::new(local_state),
             local_state_path,
-            master_pw_source: RefCell::new(None),
             msg_source: RefCell::new(None),
             tx,
             tray_snapshot,
@@ -713,11 +709,14 @@ impl App {
                 this.unlock_note(id, &password);
             });
         } else {
-            let password = self.inner.local_state.borrow().master_password.clone();
-            if password.is_empty() {
-                self.show_no_password_alert(&dialog_window);
-            } else {
-                self.lock_note(id, &password);
+            match crate::secret::get_master_password() {
+                Ok(Some(password)) if !password.is_empty() => self.lock_note(id, &password),
+                Ok(_) => self.show_no_password_alert(&dialog_window),
+                Err(err) => {
+                    if let Some(window) = self.inner.windows.borrow().get(&id) {
+                        window.show_error(&format!("Could not read the master password: {err}"));
+                    }
+                }
             }
         }
     }
@@ -1231,11 +1230,13 @@ impl App {
                     "Unavailable — requires the GlobalShortcuts portal (GNOME 47+) or a GNOME session",
                 ),
             };
+            let has_master_password =
+                matches!(crate::secret::get_master_password(), Ok(Some(pw)) if !pw.is_empty());
             let window = SettingsWindow::new(
                 &self.inner.gtk_app,
                 &self.inner.settings.borrow(),
                 self.inner.settings_path.clone(),
-                &self.inner.local_state.borrow().master_password,
+                has_master_password,
                 shortcut_support,
                 shortcut_subtitle,
                 SettingsCallbacks {
@@ -1348,8 +1349,18 @@ impl App {
                         }
                     }),
                     on_master_password: Box::new({
-                        let this = self.clone();
-                        move |password| this.master_password_changed(password)
+                        move |password| {
+                            // Explicit Set-button semantics from the
+                            // preferences UI: empty clears the secret.
+                            // The outcome travels back so the UI can show
+                            // it instead of failing silently.
+                            if password.is_empty() {
+                                crate::secret::clear_master_password()
+                            } else {
+                                crate::secret::set_master_password(&password)
+                            }
+                            .map_err(|err| err.to_string())
+                        }
                     }),
                 },
             );
@@ -1389,29 +1400,6 @@ impl App {
         {
             eprintln!("failed to remove autostart entry: {err}");
         }
-    }
-
-    /// Record a master-password change, persisting the local state
-    /// file after a short idle delay (the Preferences entry fires on
-    /// every keystroke; each save is an atomic rewrite).
-    fn master_password_changed(&self, password: String) {
-        self.inner.local_state.borrow_mut().master_password = password;
-        if let Some(source) = self.inner.master_pw_source.borrow_mut().take() {
-            cancel_source(source);
-        }
-        let this = self.clone();
-        let source = glib::timeout_add_local_once(Duration::from_secs(1), move || {
-            *this.inner.master_pw_source.borrow_mut() = None;
-            if let Err(err) = this
-                .inner
-                .local_state
-                .borrow()
-                .save(&this.inner.local_state_path)
-            {
-                eprintln!("failed to save local state: {err}");
-            }
-        });
-        *self.inner.master_pw_source.borrow_mut() = Some(source);
     }
 
     /// Mutate and persist one setting.
@@ -1507,10 +1495,6 @@ impl App {
         }
         self.refresh_tray_snapshot();
         self.save_geometry();
-        // A debounced master-password save may still be pending.
-        if let Some(source) = self.inner.master_pw_source.borrow_mut().take() {
-            cancel_source(source);
-        }
         if let Err(err) = self
             .inner
             .local_state

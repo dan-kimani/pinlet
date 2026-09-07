@@ -20,11 +20,6 @@ pub const LOCAL_STATE_FILE: &str = "local-state.json";
 pub struct LocalState {
     /// Last known window geometry per note id.
     pub window_geometry: HashMap<String, WindowGeometry>,
-    /// Master password used to lock notes. Set once in Preferences and
-    /// kept out of version control (never syncs). Stored as plaintext —
-    /// the file itself is owner-only (mode `600`), which is a stopgap
-    /// until the secret moves to the system keyring.
-    pub master_password: String,
 }
 
 /// Window position and size. GTK4 cannot position normal windows on

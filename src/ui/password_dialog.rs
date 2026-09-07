@@ -13,7 +13,11 @@ pub fn present(window: &gtk4::Window, on_password: impl Fn(String) + 'static) {
         .hexpand(true)
         .build();
 
-    let content = GtkBox::new(Orientation::Vertical, 8);
+    let content = GtkBox::new(Orientation::Vertical, 12);
+    content.set_margin_top(20);
+    content.set_margin_bottom(16);
+    content.set_margin_start(20);
+    content.set_margin_end(20);
     content.append(&Label::builder().label("Password").xalign(0.0).build());
     content.append(&first);
 
@@ -67,5 +71,11 @@ pub fn present(window: &gtk4::Window, on_password: impl Fn(String) + 'static) {
         first.connect_activate(move |_| submit());
     }
 
-    dialog.present(Some(window));
+    // Center on the note when both live on the same display. A dialog
+    // transient for a window on another display (a pinned note's X11
+    // desktop window) is placed correctly by neither compositor, so
+    // present it parentless and let it center on screen instead.
+    let parent = (Some(gtk4::prelude::RootExt::display(window)) == gtk4::gdk::Display::default())
+        .then_some(window);
+    dialog.present(parent);
 }
