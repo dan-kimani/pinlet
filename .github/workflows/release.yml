@@ -80,6 +80,5 @@ jobs:
           name: Pinlet v${{ github.event.inputs.version }}
           body_path: release-notes.md
           files: |
-            target/release/pinlet
             target/debian/*.deb
             target/generate-rpm/*.rpm

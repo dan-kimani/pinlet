@@ -28,6 +28,20 @@ use crate::ui::reminder_dialog;
 /// Stylesheet shared by every note window.
 pub const STYLE: &str = include_str!("style.css");
 
+/// Whether the Ctrl modifier is currently held. Read from the given display's
+/// keyboard rather than the event state, so it also works on the X11 desktop
+/// windows whose separate display reports an empty event state.
+fn ctrl_held(display: &gdk::Display) -> bool {
+    display
+        .default_seat()
+        .and_then(|seat| seat.keyboard())
+        .is_some_and(|keyboard| {
+            keyboard
+                .modifier_state()
+                .contains(gdk::ModifierType::CONTROL_MASK)
+        })
+}
+
 /// Callbacks from a note window into the app core.
 pub struct NoteCallbacks {
     /// The body text changed (triggers debounced save).
@@ -150,32 +164,34 @@ impl NoteWindow {
             new_btn.connect_clicked(move |_| (callbacks.on_new)());
         }
 
-        // Inline color palette: a popover of swatches. Swatches are Boxes,
-        // not Buttons — a Button draws its own theme background over
-        // `background-color`, which leaves the swatches looking black.
+        // Inline color palette: a popover of swatches. Each swatch is a flat
+        // Button wrapping a colored Box — the Box renders the color reliably
+        // (a Button draws its own theme background over `background-color`),
+        // while the Button keeps a plain `clicked` signal.
         let popover = Popover::new();
         let palette = FlowBox::builder()
             .max_children_per_line(3)
             .selection_mode(gtk4::SelectionMode::None)
             .build();
         for swatch_color in NoteColor::PALETTE {
-            let swatch = gtk4::Box::builder()
+            let swatch = Button::builder()
                 .width_request(32)
                 .height_request(32)
                 .tooltip_text(swatch_color.name())
                 .build();
-            swatch.add_css_class(swatch_color.css_class());
             swatch.add_css_class("pinlet-swatch");
-            let click = gtk4::GestureClick::new();
+            let color = gtk4::Box::new(Orientation::Horizontal, 0);
+            color.add_css_class(swatch_color.css_class());
+            color.add_css_class("pinlet-swatch");
+            color.set_hexpand(true);
+            color.set_vexpand(true);
+            swatch.set_child(Some(&color));
             {
                 let shared = shared.clone();
                 let window = window.clone();
                 let callbacks = callbacks.clone();
                 let swatch_color = swatch_color.clone();
-                click.connect_released(move |_, n_press, _, _| {
-                    if n_press != 1 {
-                        return;
-                    }
+                swatch.connect_clicked(move |_| {
                     shared.note.borrow_mut().color = swatch_color.clone();
                     window.set_css_classes(&[swatch_color.css_class()]);
                     // Clone the body and drop the borrow before calling
@@ -184,7 +200,6 @@ impl NoteWindow {
                     (callbacks.on_changed)(body);
                 });
             }
-            swatch.add_controller(click);
             palette.insert(&swatch, -1);
         }
         popover.set_child(Some(&palette));
@@ -391,6 +406,52 @@ impl NoteWindow {
             .build();
         preview_view.add_css_class("pinlet-body");
         let styler = MarkdownStyler::new(&preview_view.buffer());
+
+        // Open links in the default handler on Ctrl+click, and show a pointer
+        // cursor while hovering a link.
+        let link_click = gtk4::GestureClick::new();
+        {
+            let view = preview_view.clone();
+            link_click.connect_released(move |_gesture, n_press, x, y| {
+                if n_press != 1 || !ctrl_held(&view.display()) {
+                    return;
+                }
+                let Some(iter) = view.iter_at_location(x as i32, y as i32) else {
+                    return;
+                };
+                for tag in iter.tags() {
+                    let Some(name) = tag.name() else { continue };
+                    let Some(url) = name.as_str().strip_prefix("link:") else {
+                        continue;
+                    };
+                    let context = gtk4::gdk::Display::default()
+                        .map(|display| display.app_launch_context());
+                    if let Err(err) =
+                        gtk4::gio::AppInfo::launch_default_for_uri(url, context.as_ref())
+                    {
+                        eprintln!("failed to open link {url}: {err}");
+                    }
+                    break;
+                }
+            });
+        }
+        preview_view.add_controller(link_click);
+
+        let link_hover = gtk4::EventControllerMotion::new();
+        {
+            let view = preview_view.clone();
+            link_hover.connect_motion(move |_controller, x, y| {
+                let over_link = view
+                    .iter_at_location(x as i32, y as i32)
+                    .is_some_and(|iter| {
+                        iter.tags().iter().any(|tag| {
+                            tag.name().is_some_and(|n| n.as_str().starts_with("link:"))
+                        })
+                    });
+                view.set_cursor_from_name(over_link.then_some("pointer"));
+            });
+        }
+        preview_view.add_controller(link_hover);
 
         if locked {
             edit_view.set_editable(false);

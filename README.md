@@ -4,6 +4,13 @@ Native sticky notes for the Linux desktop. Every note is a plain Markdown
 file with YAML frontmatter plus body & inside a git repository you fully own, so
 your notes are portable, diffable, and never locked into a proprietary format.
 
+## Screenshots
+
+| | |
+| --- | --- |
+| ![Markdown edit/preview](images/markdown-rendering.png) | ![Color selector](images/color-selector.png) |
+| ![Desktop pinning](images/desktop-pinning.png) | ![System tray menu](images/native-tray-menu.png) |
+
 ## Features
 
 - **Markdown notes** with a live edit/preview toggle, interactive checklists,
@@ -94,6 +101,23 @@ makepkg -si
 The [`arch/PKGBUILD`](arch/PKGBUILD) builds from source (a `-git` package ready
 for the AUR). The app creates its data directory and git repository on first
 launch.
+
+## Local development
+
+Building from source requires a Rust toolchain ([rustup](https://rustup.rs))
+plus the GTK4 development libraries:
+
+| Distribution    | Packages                                                             |
+| --------------- | -------------------------------------------------------------------- |
+| Debian / Ubuntu | `libgtk-4-dev libadwaita-1-dev libgtk4-layer-shell-dev pkg-config`   |
+| Fedora / RHEL   | `gtk4-devel libadwaita-devel gtk4-layer-shell-devel`                 |
+| Arch            | `gtk4 libadwaita gtk4-layer-shell`                                   |
+
+Then `cargo build --release` (see [Build from source](#build-from-source)).
+
+If your distribution doesn't ship `gtk4-layer-shell`, build and install it
+locally from source — see the
+[gtk4-layer-shell](https://github.com/wmww/gtk4-layer-shell) repository.
 
 ## Usage
 

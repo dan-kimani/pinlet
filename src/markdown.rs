@@ -7,12 +7,17 @@
 //! `invisible` tag. The preview is never edited, so no cursor or round-trip
 //! concerns arise.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use gtk4::pango;
 use gtk4::prelude::*;
 use gtk4::{TextBuffer, TextTag};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
-const OPTIONS: Options = Options::ENABLE_TASKLISTS.union(Options::ENABLE_STRIKETHROUGH);
+const OPTIONS: Options = Options::ENABLE_TASKLISTS
+    .union(Options::ENABLE_STRIKETHROUGH)
+    .union(Options::ENABLE_TABLES);
 
 /// A styling decision over a byte range of the Markdown source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +46,8 @@ enum Style {
     H2,
     H3,
     Quote,
+    /// A Markdown table, rendered monospace so the columns line up.
+    Table,
     /// A bullet or number marker on a list item.
     ListMarker,
     /// Indent a list item to the given nesting depth (1-based).
@@ -92,6 +99,12 @@ fn compute_styles(text: &str) -> Vec<Span> {
     let mut item_depth: usize = 0;
     let mut item_indent_done: bool = false;
 
+    // Table syntax (pipes and the separator row) is consumed by the parser
+    // and not emitted as events, so track cell ranges to hide the rest.
+    let mut table_start: Option<usize> = None;
+    let mut table_cells: Vec<(usize, usize)> = Vec::new();
+    let mut cell_start: Option<usize> = None;
+
     for (event, range) in Parser::new_ext(text, OPTIONS).into_offset_iter() {
         let s = range.start;
         let e = range.end;
@@ -130,6 +143,25 @@ fn compute_styles(text: &str) -> Vec<Span> {
                     content_start: None,
                     content_end: None,
                 }),
+                Tag::Table(_) => {
+                    table_start = Some(s);
+                    table_cells.clear();
+                    stack.push(Active {
+                        style: Style::Table,
+                        marker: s,
+                        delimiter: 0,
+                        content_start: None,
+                        content_end: None,
+                    });
+                }
+                Tag::TableHead => stack.push(Active {
+                    style: Style::Bold,
+                    marker: s,
+                    delimiter: 0,
+                    content_start: None,
+                    content_end: None,
+                }),
+                Tag::TableCell => cell_start = Some(s),
                 Tag::CodeBlock(..) => stack.push(Active {
                     style: Style::Code,
                     marker: s,
@@ -168,8 +200,19 @@ fn compute_styles(text: &str) -> Vec<Span> {
                         }
                     }
                 }
-                TagEnd::Link => {
+                TagEnd::Link | TagEnd::TableHead => {
                     stack.pop();
+                }
+                TagEnd::TableCell => {
+                    if let Some(cs) = cell_start.take() {
+                        table_cells.push((cs, e));
+                    }
+                }
+                TagEnd::Table => {
+                    stack.pop();
+                    if let Some(ts) = table_start.take() {
+                        hide_table_syntax(&mut spans, text, ts, e, &table_cells);
+                    }
                 }
                 TagEnd::List(_) => list_depth = list_depth.saturating_sub(1),
                 TagEnd::Item => item_start = None,
@@ -223,6 +266,56 @@ fn compute_styles(text: &str) -> Vec<Span> {
     spans
 }
 
+/// Hide the pipe (`|`) and separator-row (`-`) characters of a table that
+/// fall outside any cell, so the table renders as aligned text rather than
+/// raw Markdown syntax.
+fn hide_table_syntax(
+    spans: &mut Vec<Span>,
+    text: &str,
+    start: usize,
+    end: usize,
+    cells: &[(usize, usize)],
+) {
+    let bytes = text.as_bytes();
+    for i in start..end {
+        let b = bytes[i];
+        if (b == b'|' || b == b'-') && !cells.iter().any(|&(cs, ce)| i >= cs && i < ce) {
+            spans.push(Span::hide(i, i + 1));
+        }
+    }
+}
+
+/// Find every link's text range and destination URL, in byte offsets.
+/// Links cannot nest, so a single open-link cursor is enough.
+fn compute_links(text: &str) -> Vec<(usize, usize, String)> {
+    let mut links = Vec::new();
+    let mut current: Option<(String, Option<usize>, Option<usize>)> = None;
+
+    for (event, range) in Parser::new_ext(text, OPTIONS).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                current = Some((dest_url.to_string(), None, None));
+            }
+            Event::Text(_) | Event::Code(_) => {
+                if let Some((_, start, end)) = &mut current {
+                    if start.is_none() {
+                        *start = Some(range.start);
+                    }
+                    *end = Some(range.end);
+                }
+            }
+            Event::End(TagEnd::Link) => {
+                if let Some((url, Some(start), Some(end))) = current.take() {
+                    links.push((start, end, url));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    links
+}
+
 /// Style the bullet/number and indent a list item, called once per item on
 /// its first content.
 fn emit_item_marker(
@@ -254,6 +347,7 @@ struct MarkdownTags {
     h2: TextTag,
     h3: TextTag,
     quote: TextTag,
+    table: TextTag,
     marker: TextTag,
     list_marker: TextTag,
     /// `left-margin` tags, one per extra nesting level (index 0 = depth 2).
@@ -291,6 +385,7 @@ impl MarkdownTags {
                 .left_margin(24)
                 .style(pango::Style::Italic)
                 .build(),
+            table: TextTag::builder().name("md-table").family("monospace").build(),
             marker: TextTag::builder().name("md-marker").invisible(true).build(),
             list_marker: TextTag::builder()
                 .name("md-list-marker")
@@ -322,6 +417,7 @@ impl MarkdownTags {
             &self.h2,
             &self.h3,
             &self.quote,
+            &self.table,
             &self.marker,
             &self.list_marker,
         ];
@@ -340,6 +436,7 @@ impl MarkdownTags {
             Style::H2 => &self.h2,
             Style::H3 => &self.h3,
             Style::Quote => &self.quote,
+            Style::Table => &self.table,
             Style::ListMarker => &self.list_marker,
             Style::Indent(depth) => {
                 let index = depth.saturating_sub(2).min(self.list_indent.len() - 1);
@@ -352,13 +449,19 @@ impl MarkdownTags {
 /// Styles a note preview buffer on demand.
 pub struct MarkdownStyler {
     tags: MarkdownTags,
+    /// Per-URL link tags, named with the URL so GTK's `activate-link` emits
+    /// the URL on Ctrl+click. Created on demand and cached.
+    links: RefCell<HashMap<String, TextTag>>,
 }
 
 impl MarkdownStyler {
     /// Create the styler for `buffer`, registering its tags once.
     pub fn new(buffer: &TextBuffer) -> Self {
         let tags = MarkdownTags::new(&buffer.tag_table());
-        Self { tags }
+        Self {
+            tags,
+            links: RefCell::new(HashMap::new()),
+        }
     }
 
     /// Re-render the buffer's Markdown source: clear prior styling, then
@@ -370,6 +473,9 @@ impl MarkdownStyler {
         let text = buffer.text(&start, &end, true).to_string();
 
         for tag in self.tags.all() {
+            buffer.remove_tag(tag, &start, &end);
+        }
+        for tag in self.links.borrow().values() {
             buffer.remove_tag(tag, &start, &end);
         }
         if !text.trim().is_empty() {
@@ -386,7 +492,28 @@ impl MarkdownStyler {
                 let tag_end = buffer.iter_at_offset(char_of[span.end] as i32);
                 buffer.apply_tag(tag, &tag_start, &tag_end);
             }
+            for (ls, le, url) in compute_links(&text) {
+                if ls >= le {
+                    continue;
+                }
+                let tag = self.link_tag(buffer, &url);
+                let tag_start = buffer.iter_at_offset(char_of[ls] as i32);
+                let tag_end = buffer.iter_at_offset(char_of[le] as i32);
+                buffer.apply_tag(&tag, &tag_start, &tag_end);
+            }
         }
+    }
+
+    /// Get (or create and register) the link tag for `url`.
+    fn link_tag(&self, buffer: &TextBuffer, url: &str) -> TextTag {
+        let mut links = self.links.borrow_mut();
+        if let Some(tag) = links.get(url) {
+            return tag.clone();
+        }
+        let tag = TextTag::builder().name(&format!("link:{url}")).build();
+        buffer.tag_table().add(&tag);
+        links.insert(url.to_string(), tag.clone());
+        tag
     }
 }
 
@@ -575,4 +702,29 @@ mod tests {
         let a = annotated(text, &spans);
         assert!(a.contains(&(SpanKind::Style(Style::Indent(2)), "child")));
     }
+
+    #[test]
+    fn links_extract_range_and_url() {
+        let text = "See [GitHub](https://github.com/dan-kimani/pinlet) now.";
+        let links = compute_links(text);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].2, "https://github.com/dan-kimani/pinlet");
+        assert_eq!(&text[links[0].0..links[0].1], "GitHub");
+    }
+
+    #[test]
+    fn table_styles_cells() {
+        let text = "| A | B |\n| --- | --- |\n| 1 | 2 |\n";
+        let spans = compute_styles(text);
+        let a = annotated(text, &spans);
+        assert!(a.contains(&(SpanKind::Style(Style::Table), "A")));
+        assert!(a.contains(&(SpanKind::Style(Style::Table), "B")));
+        assert!(a.contains(&(SpanKind::Style(Style::Table), "1")));
+        assert!(a.contains(&(SpanKind::Style(Style::Table), "2")));
+        // Header cells are bold; pipes and separator dashes are hidden.
+        assert!(a.contains(&(SpanKind::Style(Style::Bold), "A")));
+        assert!(a.contains(&(SpanKind::Hide, "|")));
+        assert!(a.contains(&(SpanKind::Hide, "-")));
+    }
+
 }
