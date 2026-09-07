@@ -4,12 +4,10 @@ mod colors;
 mod note_window;
 pub mod password_dialog;
 mod reminder_dialog;
-mod search_window;
 mod settings_window;
 pub mod x11;
 
 pub use note_window::{NoteCallbacks, NoteWindow};
-pub use search_window::SearchWindow;
 pub use settings_window::{SettingsCallbacks, SettingsWindow};
 
 use std::cell::RefCell;

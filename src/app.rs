@@ -19,7 +19,6 @@ use crate::cli;
 use crate::error::AppResult;
 use crate::messages::Msg;
 use crate::pinning::PinBackend;
-use crate::search::SearchIndex;
 use crate::settings::{Settings, SETTINGS_FILE};
 use crate::storage::{
     crypto, GitRepo, LocalState, Note, NoteColor, NoteStore, Recurrence, Reminder,
@@ -28,7 +27,7 @@ use crate::storage::{
 use crate::timer::cancel_source;
 use crate::tray::{PinletTray, TraySnapshot};
 use crate::ui::password_dialog;
-use crate::ui::{NoteCallbacks, NoteWindow, SearchWindow, SettingsCallbacks, SettingsWindow};
+use crate::ui::{NoteCallbacks, NoteWindow, SettingsCallbacks, SettingsWindow};
 
 /// State shared between one note window and the app core.
 pub struct SharedNote {
@@ -101,13 +100,9 @@ struct AppInner {
     tick_source: RefCell<Option<SourceId>>,
     /// Debounced geometry-save timer.
     geometry_source: RefCell<Option<SourceId>>,
-    /// In-memory search index, kept in sync on save/delete.
-    search_index: RefCell<SearchIndex>,
     /// Machine-local state (git-ignored).
     local_state: RefCell<LocalState>,
     local_state_path: PathBuf,
-    /// The single quick-find window, created lazily.
-    search: RefCell<Option<Rc<SearchWindow>>>,
     /// Drain timer for the background message channel.
     msg_source: RefCell<Option<SourceId>>,
     /// Sender side of the background message channel.
@@ -157,13 +152,7 @@ impl App {
         let local_state = LocalState::load(&local_state_path)?;
 
         let mut notes = HashMap::new();
-        let mut search_index = SearchIndex::default();
         for (note, body) in store.load_all()? {
-            // Locked notes' bodies are encrypted blobs — never index
-            // them (spec §3.10).
-            if !note.is_locked {
-                search_index.update(note.id, &note.title, &body);
-            }
             notes.insert(
                 note.id,
                 Rc::new(SharedNote {
@@ -226,10 +215,8 @@ impl App {
             commit_message: RefCell::new(String::new()),
             tick_source: RefCell::new(None),
             geometry_source: RefCell::new(None),
-            search_index: RefCell::new(search_index),
             local_state: RefCell::new(local_state),
             local_state_path,
-            search: RefCell::new(None),
             msg_source: RefCell::new(None),
             tx,
             tray_snapshot,
@@ -331,13 +318,6 @@ impl App {
         }
         {
             let this = self.clone();
-            let action = gio::SimpleAction::new("search", None);
-            action.connect_activate(move |_, _| this.open_search());
-            app.add_action(&action);
-            app.set_accels_for_action("app.search", &["<Primary><Shift>f"]);
-        }
-        {
-            let this = self.clone();
             let action = gio::SimpleAction::new("preferences", None);
             action.connect_activate(move |_, _| this.open_settings());
             app.add_action(&action);
@@ -368,7 +348,6 @@ impl App {
             }
             Msg::FocusNote(id) => self.open_note(id),
             Msg::ToggleAll => self.toggle_all(),
-            Msg::Search => self.open_search(),
             Msg::Snooze { note, due, minutes } => self.snooze_reminder(note, due, minutes),
             Msg::OpenSettings => self.open_settings(),
             Msg::GitPull => self.git_pull(),
@@ -598,7 +577,6 @@ impl App {
         {
             eprintln!("failed to remove plaintext note {id}: {err}");
         }
-        self.inner.search_index.borrow_mut().remove(id);
         drop(note);
         *self.inner.commit_message.borrow_mut() = format!("Lock note '{title}'");
         self.schedule_commit();
@@ -642,7 +620,6 @@ impl App {
         {
             eprintln!("failed to remove locked file for note {id}: {err}");
         }
-        self.inner.search_index.borrow_mut().update(id, title, body);
         let display = if title.is_empty() {
             "Untitled note"
         } else {
@@ -737,7 +714,6 @@ impl App {
             .borrow_mut()
             .window_geometry
             .remove(&id.to_string());
-        self.inner.search_index.borrow_mut().remove(id);
         if let Err(err) = self.inner.store.delete(id) {
             eprintln!("failed to delete note {id}: {err}");
         }
@@ -778,7 +754,7 @@ impl App {
         let mut note = shared.note.borrow_mut();
         let is_locked = note.is_locked;
         // For locked notes `body` is the encrypted blob: never derive
-        // a title from it or index it.
+        // a title from it.
         if !is_locked {
             note.title = Note::derive_title(&body);
         }
@@ -786,14 +762,7 @@ impl App {
             eprintln!("failed to save note {id}: {err}");
             return;
         }
-        let title = note.title.clone();
         drop(note);
-        if !is_locked {
-            self.inner
-                .search_index
-                .borrow_mut()
-                .update(id, &title, &body);
-        }
         let display = shared.display_title();
         *self.inner.commit_message.borrow_mut() = format!("Update '{display}'");
         self.schedule_commit();
@@ -1163,32 +1132,6 @@ impl App {
                 continue;
             };
             window.apply_color(&color);
-        }
-    }
-
-    /// Open (or focus) the quick-find window.
-    fn open_search(&self) {
-        if self.inner.search.borrow().is_none() {
-            let window = SearchWindow::new(
-                &self.inner.gtk_app,
-                {
-                    let this = self.clone();
-                    move |query| {
-                        let hits = this.inner.search_index.borrow().query(&query, 20);
-                        if let Some(search) = this.inner.search.borrow().as_ref() {
-                            search.set_results(&hits);
-                        }
-                    }
-                },
-                {
-                    let this = self.clone();
-                    move |id| this.focus_note(id)
-                },
-            );
-            *self.inner.search.borrow_mut() = Some(window);
-        }
-        if let Some(search) = self.inner.search.borrow().as_ref() {
-            search.present();
         }
     }
 

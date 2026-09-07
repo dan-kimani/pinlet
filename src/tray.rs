@@ -227,7 +227,6 @@ impl Tray for PinletTray {
         }
 
         items.push(MenuItem::Separator);
-        items.push(Self::item("Search…", "system-search-symbolic", Msg::Search, &self.tx));
         items.push(Self::item(
             "Preferences",
             "preferences-system-symbolic",

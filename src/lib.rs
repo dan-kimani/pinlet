@@ -16,7 +16,6 @@ pub mod gnome_shortcut;
 pub mod markdown;
 pub mod messages;
 pub mod pinning;
-pub mod search;
 pub mod settings;
 pub mod shortcuts;
 pub mod storage;

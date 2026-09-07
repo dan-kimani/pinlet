@@ -23,8 +23,6 @@ pub enum Msg {
         /// How many minutes to push it out.
         minutes: i64,
     },
-    /// Open the quick search window.
-    Search,
     /// Open the preferences window.
     OpenSettings,
     /// Quit the application.
