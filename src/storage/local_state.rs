@@ -21,7 +21,9 @@ pub struct LocalState {
     /// Last known window geometry per note id.
     pub window_geometry: HashMap<String, WindowGeometry>,
     /// Master password used to lock notes. Set once in Preferences and
-    /// kept out of version control (never syncs).
+    /// kept out of version control (never syncs). Stored as plaintext —
+    /// the file itself is owner-only (mode `600`), which is a stopgap
+    /// until the secret moves to the system keyring.
     pub master_password: String,
 }
 
@@ -50,14 +52,12 @@ impl LocalState {
         serde_json::from_str(&raw).map_err(|err| AppError::Settings(err.to_string()))
     }
 
-    /// Atomically persist to `path`.
+    /// Atomically persist to `path` with owner-only permissions (the
+    /// file holds the master password).
     pub fn save(&self, path: &Path) -> AppResult<()> {
         let raw = serde_json::to_string_pretty(self)
             .map_err(|err| AppError::Settings(err.to_string()))?;
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, raw)?;
-        fs::rename(&tmp, path)?;
-        Ok(())
+        crate::fs::atomic_write_private(path, raw.as_bytes())
     }
 }
 
@@ -67,12 +67,18 @@ mod tests {
 
     #[test]
     fn round_trips_through_json() {
-        let path = std::env::temp_dir().join(format!("pinlet-local-state-{}.json", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("pinlet-local-state-{}.json", uuid::Uuid::new_v4()));
 
         let mut state = LocalState::default();
         state.window_geometry.insert(
             "abc".to_owned(),
-            WindowGeometry { x: 10, y: 20, width: 300, height: 400 },
+            WindowGeometry {
+                x: 10,
+                y: 20,
+                width: 300,
+                height: 400,
+            },
         );
         state.save(&path).unwrap();
 
@@ -88,7 +94,8 @@ mod tests {
 
     #[test]
     fn missing_file_loads_empty() {
-        let path = std::env::temp_dir().join(format!("pinlet-missing-{}.json", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("pinlet-missing-{}.json", uuid::Uuid::new_v4()));
         let state = LocalState::load(&path).unwrap();
         assert!(state.window_geometry.is_empty());
     }

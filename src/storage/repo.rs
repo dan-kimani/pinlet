@@ -98,12 +98,21 @@ impl GitRepo {
         } else {
             "# Machine-specific state — never sync\n".to_owned()
         };
+        // Appended entries are matched line-wise below: without a
+        // trailing newline the first one would glue onto the last line.
+        if !contents.is_empty() && !contents.ends_with('\n') {
+            contents.push('\n');
+        }
         let mut changed = false;
         for entry in [
             "local-state.json",
             "desktop-positions.json",
             "locked/",
             "*.md.tmp",
+            // Atomic-write temp files (`settings.json.tmp`,
+            // `local-state.json.tmp`) must never be committed if a
+            // crash leaves one behind while `git add --all` runs.
+            "*.tmp",
         ] {
             if !contents.lines().any(|line| line.trim() == entry) {
                 contents.push_str(entry);

@@ -3,8 +3,8 @@
 //! directory and never sync.
 
 use argon2::Argon2;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use uuid::Uuid;
@@ -48,7 +48,9 @@ pub fn decrypt(password: &str, encoded: &str) -> AppResult<String> {
         .decode(encoded.trim())
         .map_err(|err| AppError::Crypto(err.to_string()))?;
     let payload_len = MAGIC.len() + SALT_LEN + NONCE_LEN;
-    if !blob.starts_with(MAGIC) || blob.len() < payload_len {
+    // `<=`: an empty ciphertext would otherwise fail authentication
+    // below and misreport as "wrong password".
+    if !blob.starts_with(MAGIC) || blob.len() <= payload_len {
         return Err(AppError::Crypto("not a Pinlet encrypted blob".to_owned()));
     }
 

@@ -29,8 +29,6 @@ pub struct Settings {
     pub enable_global_shortcut: bool,
     /// Start the app on login (Phase 3).
     pub autostart: bool,
-    /// Retention for archived notes, in days (Phase 4).
-    pub archive_retention_days: u32,
     /// Whether to sync the note repo with a git remote (push/pull).
     pub git_sync_enabled: bool,
     /// Remote URL for git sync (empty = unset).
@@ -52,7 +50,6 @@ impl Default for Settings {
             auto_save_debounce_ms: 500,
             enable_global_shortcut: false,
             autostart: false,
-            archive_retention_days: 30,
             git_sync_enabled: false,
             git_remote_url: String::new(),
             git_branch: "main".to_owned(),
@@ -76,9 +73,6 @@ impl Settings {
     pub fn save(&self, path: &Path) -> AppResult<()> {
         let raw = serde_json::to_string_pretty(self)
             .map_err(|err| AppError::Settings(err.to_string()))?;
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, raw)?;
-        fs::rename(&tmp, path)?;
-        Ok(())
+        crate::fs::atomic_write(path, raw.as_bytes())
     }
 }

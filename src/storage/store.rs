@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use uuid::Uuid;
 
-use super::model::{parse_note_file, render_file, Note};
+use super::model::{Note, parse_note_file, render_file};
 use crate::error::AppResult;
 
 /// Directory name under the XDG data dir; this is also the git repo.
@@ -35,11 +35,6 @@ impl NoteStore {
     /// locked notes never sync (spec §3.10).
     pub fn locked_dir(&self) -> PathBuf {
         self.root.join("locked")
-    }
-
-    /// Repository root (the data directory).
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     /// Directory containing the note files.
@@ -84,10 +79,12 @@ impl NoteStore {
         } else {
             self.path_for(note.id)
         };
-        let tmp = path.with_extension("md.tmp");
-        fs::write(&tmp, rendered)?;
-        fs::rename(&tmp, &path)?;
-        Ok(())
+        // The directories are created at open, but the user may delete
+        // one mid-session — recreate rather than fail the save.
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        crate::fs::atomic_write(&path, rendered.as_bytes())
     }
 
     /// Remove a note's files — plain and locked — if they exist.
@@ -111,8 +108,8 @@ fn is_note_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::NoteColor;
     use super::*;
+    use crate::storage::NoteColor;
 
     /// A unique scratch directory for one test.
     fn temp_root() -> PathBuf {

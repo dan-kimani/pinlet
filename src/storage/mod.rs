@@ -10,7 +10,7 @@ mod store;
 
 pub mod crypto;
 
-pub use local_state::{LocalState, WindowGeometry, LOCAL_STATE_FILE};
-pub use model::{parse_note_file, render_file, Note, NoteColor, Recurrence, Reminder};
+pub use local_state::{LOCAL_STATE_FILE, LocalState, WindowGeometry};
+pub use model::{Note, NoteColor, Recurrence, Reminder, parse_note_file, render_file};
 pub use repo::GitRepo;
-pub use store::{NoteStore, DATA_DIR_NAME};
+pub use store::{DATA_DIR_NAME, NoteStore};

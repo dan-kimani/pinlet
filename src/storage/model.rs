@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Duration, Utc, Weekday};
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
@@ -37,6 +37,22 @@ pub enum NoteColor {
 }
 
 impl NoteColor {
+    /// Parse a user-supplied color: a palette name or `#RRGGBB` hex.
+    /// Anything else is rejected — unknown strings must not silently
+    /// become custom colors that generate broken CSS.
+    pub fn parse_validated(s: &str) -> Option<Self> {
+        match s {
+            "Yellow" => Some(Self::Yellow),
+            "Green" => Some(Self::Green),
+            "Blue" => Some(Self::Blue),
+            "Pink" => Some(Self::Pink),
+            "Purple" => Some(Self::Purple),
+            "Charcoal" => Some(Self::Charcoal),
+            hex if is_hex_color(hex) => Some(Self::Custom(hex.to_owned())),
+            _ => None,
+        }
+    }
+
     /// The six named colors offered by the inline palette.
     pub const PALETTE: [Self; 6] = [
         Self::Yellow,
@@ -119,9 +135,6 @@ pub struct Reminder {
     /// Last time this reminder fired, if ever.
     #[serde(default)]
     pub last_fired_at: Option<DateTime<Utc>>,
-    /// How many times it has been snoozed.
-    #[serde(default)]
-    pub snooze_count: u32,
 }
 
 /// Repetition rule for a reminder.
@@ -171,6 +184,31 @@ impl<'de> Deserialize<'de> for Recurrence {
     }
 }
 
+impl Recurrence {
+    /// The next occurrence strictly after `due`.
+    ///
+    /// `Custom(0)` (reachable via hand-edited frontmatter) is clamped
+    /// to daily so callers advancing in a loop always terminate.
+    pub fn next_after(&self, due: DateTime<Utc>) -> DateTime<Utc> {
+        match self {
+            Self::None => due,
+            Self::Daily => due + Duration::days(1),
+            Self::Weekly => due + Duration::days(7),
+            Self::Weekdays => next_weekday(due),
+            Self::Custom(n) => due + Duration::days(i64::from((*n).max(1))),
+        }
+    }
+}
+
+/// The next weekday (Mon–Fri) strictly after `due`.
+fn next_weekday(due: DateTime<Utc>) -> DateTime<Utc> {
+    let mut next = due + Duration::days(1);
+    while matches!(next.weekday(), Weekday::Sat | Weekday::Sun) {
+        next += Duration::days(1);
+    }
+    next
+}
+
 /// A sticky note: frontmatter metadata plus a Markdown body.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Note {
@@ -182,9 +220,6 @@ pub struct Note {
     /// Background color.
     #[serde(default)]
     pub color: NoteColor,
-    /// Logical workspace grouping (unused for now).
-    #[serde(default = "default_workspace")]
-    pub workspace_id: i64,
     /// Pinned to the desktop layer (spec §3.6).
     #[serde(default)]
     pub is_pinned_to_desktop: bool,
@@ -213,7 +248,6 @@ impl Note {
             id,
             title: String::new(),
             color,
-            workspace_id: -1,
             is_pinned_to_desktop: false,
             is_always_on_top: false,
             is_locked: false,
@@ -231,11 +265,6 @@ impl Note {
             .trim()
             .to_owned()
     }
-}
-
-/// Serialize the default workspace sentinel (`-1`).
-fn default_workspace() -> i64 {
-    -1
 }
 
 /// Render a note to its on-disk Markdown representation: YAML
@@ -266,12 +295,23 @@ pub fn parse_note_file(path: &Path) -> AppResult<(Note, String)> {
     Ok((note, body.to_owned()))
 }
 
+/// Check for `#RRGGBB` hex (frontmatter and CLI input).
+fn is_hex_color(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() == 7 && bytes[0] == b'#' && bytes[1..].iter().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Split `---\n{yaml}\n---\n{body}`; `None` without the opening
 /// delimiter. The closing delimiter is the first line that is exactly
 /// `---` after the opening one, so the body may contain `---` lines.
+/// CRLF line endings (hand-edited on Windows) are accepted too.
 fn split_frontmatter(raw: &str) -> Option<(&str, &str)> {
-    let rest = raw.strip_prefix("---\n")?;
-    let (yaml, body) = rest.split_once("\n---\n")?;
+    let rest = raw
+        .strip_prefix("---\n")
+        .or_else(|| raw.strip_prefix("---\r\n"))?;
+    let (yaml, body) = rest
+        .split_once("\n---\n")
+        .or_else(|| rest.split_once("\r\n---\r\n"))?;
     Some((yaml, body))
 }
 
@@ -286,7 +326,6 @@ mod tests {
             due_at: Utc::now(),
             recurrence_rule: Recurrence::Custom(5),
             last_fired_at: None,
-            snooze_count: 2,
         });
         let body = "first line\nsecond line\n\n---\nnot a delimiter\n";
         let rendered = render_file(&note, body).unwrap();
@@ -297,7 +336,6 @@ mod tests {
         assert_eq!(parsed.id, note.id);
         assert_eq!(parsed.color, NoteColor::Blue);
         assert_eq!(parsed.reminders[0].recurrence_rule, Recurrence::Custom(5));
-        assert_eq!(parsed.reminders[0].snooze_count, 2);
         assert_eq!(parsed_body, body);
     }
 
@@ -316,6 +354,44 @@ mod tests {
     }
 
     #[test]
+    fn recurrence_advances_to_next_occurrence() {
+        // 2024-01-05 was a Friday.
+        let fri = "2024-01-05T10:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            Recurrence::Daily.next_after(fri),
+            at("2024-01-06T10:00:00Z")
+        );
+        assert_eq!(
+            Recurrence::Weekly.next_after(fri),
+            at("2024-01-12T10:00:00Z")
+        );
+        // Friday rolls to Monday; weekend starts jump there too.
+        assert_eq!(
+            Recurrence::Weekdays.next_after(fri),
+            at("2024-01-08T10:00:00Z")
+        );
+        assert_eq!(
+            Recurrence::Weekdays.next_after(at("2024-01-06T10:00:00Z")),
+            at("2024-01-08T10:00:00Z")
+        );
+        assert_eq!(
+            Recurrence::Weekdays.next_after(at("2024-01-03T10:00:00Z")),
+            at("2024-01-04T10:00:00Z")
+        );
+        assert_eq!(
+            Recurrence::Custom(3).next_after(fri),
+            at("2024-01-08T10:00:00Z")
+        );
+        // Custom(0) would never advance — clamped to daily so the
+        // catch-up loop in the reminder engine always terminates.
+        assert_eq!(
+            Recurrence::Custom(0).next_after(fri),
+            at("2024-01-06T10:00:00Z")
+        );
+    }
+
+    #[test]
     fn color_wire_format() {
         let yaml = serde_yaml_ng::to_string(&NoteColor::Yellow).unwrap();
         assert_eq!(yaml.trim(), "Yellow");
@@ -325,6 +401,27 @@ mod tests {
 
         let unknown: NoteColor = serde_yaml_ng::from_str("\"anything\"").unwrap();
         assert_eq!(unknown, NoteColor::Custom("anything".to_owned()));
+    }
+
+    #[test]
+    fn validated_colors_accept_palette_and_hex_only() {
+        assert_eq!(NoteColor::parse_validated("Blue"), Some(NoteColor::Blue));
+        assert_eq!(
+            NoteColor::parse_validated("#ff00aa"),
+            Some(NoteColor::Custom("#ff00aa".to_owned()))
+        );
+        assert_eq!(NoteColor::parse_validated("chartreuse"), None);
+        assert_eq!(NoteColor::parse_validated("#xyz"), None);
+        assert_eq!(NoteColor::parse_validated(""), None);
+    }
+
+    #[test]
+    fn split_frontmatter_accepts_crlf() {
+        let raw = "---\r\nid: 1\r\n---\r\nbody\r\n";
+        let (yaml, body) = split_frontmatter(raw).unwrap();
+        assert_eq!(yaml, "id: 1");
+        assert_eq!(body, "body\r\n");
+        assert!(split_frontmatter("no frontmatter").is_none());
     }
 
     #[test]
