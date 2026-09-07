@@ -6,8 +6,8 @@ your notes are portable, diffable, and never locked into a proprietary format.
 
 ## Features
 
-- **Markdown notes** with interactive checklists, color themes, and full-text
-  search.
+- **Markdown notes** with a live edit/preview toggle, interactive checklists,
+  and six color themes.
 - **Reminders** with desktop notifications (open, snooze, dismiss) and an
   upcoming-reminders list in the system tray.
 - **Desktop pinning** — pin a note so it sits on the desktop layer, above the
@@ -15,8 +15,9 @@ your notes are portable, diffable, and never locked into a proprietary format.
 - **Lock notes** with encryption (Argon2 key derivation + ChaCha20-Poly1305).
 - **System tray** with quick actions and the next few upcoming reminders.
 - **Global shortcut** to capture a note from anywhere.
-- **Git-backed** — the note directory is a git repository with auto-commit, so
-  every change is versioned and diffable.
+- **Git-backed** — the note directory is a git repository with auto-commit and
+  push/pull sync, so every change is versioned, diffable, and shareable across
+  machines.
 - **Dark-mode aware**, built on GTK4 + libadwaita.
 
 ## How notes are stored
@@ -42,6 +43,13 @@ after an idle delay, on lock, and on quit). Locked notes are encrypted and
 stored git-ignored in `locked/`, so they never sync.
 
 ## Install
+
+### Prebuilt packages (recommended)
+
+Download the latest release from
+[GitHub Releases](https://github.com/dan-kimani/pinlet/releases). Each release
+attaches Debian (`.deb`) and RPM (`.rpm`) packages plus the raw `pinlet`
+binary.
 
 ### Build from source
 
