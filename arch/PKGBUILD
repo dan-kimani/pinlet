@@ -1,7 +1,7 @@
 # Maintainer: Daniel Kimani <dankim761@gmail.com>
 
 pkgname=pinlet-git
-pkgver=0.1.1.r0.g186d18c
+pkgver=0.1.2.r0.g186d18c
 pkgrel=1
 pkgdesc="Native sticky notes for the Linux desktop"
 arch=('x86_64')
@@ -16,7 +16,7 @@ pkgver() {
   cd "$srcdir/$pkgname"
   git describe --long --tags 2>/dev/null \
     | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g' \
-    || printf "0.1.1.r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+    || printf "0.1.2.r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 build() {
