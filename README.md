@@ -44,6 +44,9 @@ stored git-ignored in `locked/`, so they never sync.
 
 ## Install
 
+Pinlet is packaged for **Debian/Ubuntu**, **Fedora/RHEL/openSUSE**, and
+**Arch Linux (AUR)**, and is available as a **Flatpak**.
+
 ### Prebuilt packages (recommended)
 
 Download the latest release from

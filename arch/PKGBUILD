@@ -7,8 +7,8 @@ pkgdesc="Native sticky notes for the Linux desktop"
 arch=('x86_64')
 url="https://github.com/dan-kimani/pinlet"
 license=('MIT')
-depends=('gtk4' 'libadwaita' 'git')
-makedepends=('cargo')
+depends=('gtk4' 'libadwaita' 'gtk4-layer-shell' 'git')
+makedepends=('cargo' 'gtk4' 'libadwaita' 'gtk4-layer-shell')
 source=("$pkgname::git+$url.git")
 sha256sums=('SKIP')
 

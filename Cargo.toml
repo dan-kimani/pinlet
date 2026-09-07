@@ -35,7 +35,7 @@ pulldown-cmark = "0.13.4"
 [package.metadata.deb]
 maintainer = "Daniel Kimani <dankim761@gmail.com>"
 copyright = "2026, Daniel Kimani"
-depends = "libgtk-4-1 (>= 4.10), libadwaita-1-0 (>= 1.4), git"
+depends = "libgtk-4-1 (>= 4.10), libadwaita-1-0 (>= 1.4), libgtk4-layer-shell0, git"
 section = "utility"
 priority = "optional"
 maintainer-scripts = "debian/"
@@ -61,6 +61,7 @@ post_install_script = "debian/postinst"
 
 [package.metadata.generate-rpm.requires]
 git = ""
+gtk4-layer-shell = ""
 
 [[package.metadata.generate-rpm.assets]]
 source = "target/release/pinlet"
