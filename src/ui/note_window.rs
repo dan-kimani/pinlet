@@ -449,6 +449,12 @@ impl NoteWindow {
             });
         }
 
+        // Open in preview mode when the note already has content; an empty
+        // note starts in edit mode so the user can begin typing.
+        if !locked && !shared.body.borrow().trim().is_empty() {
+            preview_toggle.set_active(true);
+        }
+
         // Drag & drop appends to the editor (which holds the editable
         // source), turning file URIs into Markdown links.
         let drop_target = gtk4::DropTarget::new(glib::Type::STRING, gdk::DragAction::COPY);
