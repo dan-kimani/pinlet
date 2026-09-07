@@ -6,10 +6,11 @@ your notes are portable, diffable, and never locked into a proprietary format.
 
 ## Screenshots
 
-| | |
-| --- | --- |
-| ![Markdown edit/preview](images/markdown-rendering.png) | ![Color selector](images/color-selector.png) |
-| ![Desktop pinning](images/desktop-pinning.png) | ![System tray menu](images/native-tray-menu.png) |
+|                                                         |                                              |                                                  |
+| ------------------------------------------------------- | -------------------------------------------- | ------------------------------------------------ |
+| ![Markdown edit/preview](images/markdown-rendering.png) | ![Color selector](images/color-selector.png) | ![System tray menu](images/native-tray-menu.png) |
+
+![Desktop pinning](images/desktop-pinning.png)
 
 ## Features
 
@@ -107,11 +108,11 @@ launch.
 Building from source requires a Rust toolchain ([rustup](https://rustup.rs))
 plus the GTK4 development libraries:
 
-| Distribution    | Packages                                                             |
-| --------------- | -------------------------------------------------------------------- |
-| Debian / Ubuntu | `libgtk-4-dev libadwaita-1-dev libgtk4-layer-shell-dev pkg-config`   |
-| Fedora / RHEL   | `gtk4-devel libadwaita-devel gtk4-layer-shell-devel`                 |
-| Arch            | `gtk4 libadwaita gtk4-layer-shell`                                   |
+| Distribution    | Packages                                                           |
+| --------------- | ------------------------------------------------------------------ |
+| Debian / Ubuntu | `libgtk-4-dev libadwaita-1-dev libgtk4-layer-shell-dev pkg-config` |
+| Fedora / RHEL   | `gtk4-devel libadwaita-devel gtk4-layer-shell-devel`               |
+| Arch            | `gtk4 libadwaita gtk4-layer-shell`                                 |
 
 Then `cargo build --release` (see [Build from source](#build-from-source)).
 
