@@ -1182,10 +1182,11 @@ impl App {
         }
     }
 
-    /// Keep the tray menu's upcoming-reminders section current.
+    /// Keep the tray menu's upcoming-reminders and notes sections current.
     fn refresh_tray_snapshot(&self) {
         let now = Utc::now();
         let mut upcoming = Vec::new();
+        let mut notes = Vec::new();
         for shared in self.inner.notes.borrow().values() {
             let note = shared.note.borrow();
             let title = if note.is_locked {
@@ -1193,6 +1194,10 @@ impl App {
             } else {
                 Note::derive_title(&shared.body.borrow())
             };
+            notes.push(crate::tray::TrayNote {
+                id: note.id,
+                title: title.clone(),
+            });
             for reminder in &note.reminders {
                 let not_fired = reminder
                     .last_fired_at
@@ -1208,8 +1213,15 @@ impl App {
         }
         upcoming.sort_by_key(|reminder| reminder.due);
         upcoming.truncate(5);
+        notes.sort_by(|a, b| {
+            a.title
+                .to_lowercase()
+                .cmp(&b.title.to_lowercase())
+                .then_with(|| a.id.cmp(&b.id))
+        });
         if let Ok(mut snapshot) = self.inner.tray_snapshot.lock() {
             snapshot.upcoming = upcoming;
+            snapshot.notes = notes;
         }
     }
 

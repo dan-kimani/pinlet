@@ -114,12 +114,23 @@ pub struct DueReminder {
     pub due: DateTime<Utc>,
 }
 
+/// A note listed in the tray menu's Notes section.
+#[derive(Debug, Clone)]
+pub struct TrayNote {
+    /// Note id.
+    pub id: Uuid,
+    /// Display title.
+    pub title: String,
+}
+
 /// Snapshot of everything the tray menu needs; written by the app
 /// core, read by the tray thread.
 #[derive(Debug, Clone, Default)]
 pub struct TraySnapshot {
     /// Upcoming reminders, sorted by due time.
     pub upcoming: Vec<DueReminder>,
+    /// All notes, sorted by title, so a closed one can be reopened.
+    pub notes: Vec<TrayNote>,
     /// Git sync status for the sync menu item.
     pub sync: SyncState,
 }
@@ -161,6 +172,34 @@ impl PinletTray {
             }),
             ..Default::default()
         })
+    }
+
+    /// One page of the Notes submenu: up to five notes, plus a nested
+    /// "More…" page while notes remain.
+    fn notes_page(notes: &[TrayNote], tx: &MsgSender<Msg>) -> Vec<MenuItem<Self>> {
+        const PAGE: usize = 5;
+        let mut items: Vec<MenuItem<Self>> = notes
+            .iter()
+            .take(PAGE)
+            .map(|note| {
+                Self::item(
+                    &note.title,
+                    "document-open-symbolic",
+                    Msg::FocusNote(note.id),
+                    tx,
+                )
+            })
+            .collect();
+        if notes.len() > PAGE {
+            let rest = &notes[PAGE..];
+            items.push(MenuItem::SubMenu(SubMenu {
+                label: format!("More… ({} remaining)", rest.len()),
+                icon_name: "view-more-symbolic".to_owned(),
+                submenu: Self::notes_page(rest, tx),
+                ..Default::default()
+            }));
+        }
+        items
     }
 
     /// A reminder entry: its due label as a submenu carrying open/snooze
@@ -265,6 +304,19 @@ impl Tray for PinletTray {
             .clone();
         items.push(MenuItem::Separator);
         items.push(Self::sync_item(&snapshot.sync, &self.tx));
+
+        // Every note gets an entry: closing a window must not strand
+        // the note until restart. Paged five per level with a nested
+        // "More…" entry — menus have no scrollbar primitive, so long
+        // lists stay navigable without growing any single menu.
+        if !snapshot.notes.is_empty() {
+            items.push(MenuItem::SubMenu(SubMenu {
+                label: "Notes".to_owned(),
+                icon_name: "document-open-symbolic".to_owned(),
+                submenu: Self::notes_page(&snapshot.notes, &self.tx),
+                ..Default::default()
+            }));
+        }
 
         // Dynamic section: top 5 upcoming reminders (spec §3.3).
         if !snapshot.upcoming.is_empty() {
