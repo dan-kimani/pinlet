@@ -28,7 +28,25 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            meson \
+            ninja-build \
+            libwayland-dev \
+            wayland-protocols \
+            libgirepository1.0-dev
+
+      # gtk4-layer-shell isn't packaged on Ubuntu 24.04 (ubuntu-latest), so
+      # build it from source for the wlr-layer-shell pinning backend.
+      - name: Build and install gtk4-layer-shell
+        run: |
+          git clone https://github.com/wmww/gtk4-layer-shell
+          cd gtk4-layer-shell
+          meson setup build
+          ninja -C build
+          sudo ninja -C build install
+          sudo ldconfig
 
       - name: Bump version
         run: |
