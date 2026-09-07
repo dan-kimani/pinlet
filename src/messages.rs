@@ -5,6 +5,22 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+/// Git sync status shown by the tray indicator (and preferences).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SyncState {
+    /// Sync isn't set up: disabled or no remote URL configured.
+    #[default]
+    Unconfigured,
+    /// A sync (pull → commit → push) is running right now.
+    Syncing,
+    /// The last sync succeeded; notes are in sync with the remote.
+    InSync,
+    /// A merge conflict needs manual resolution in the repository.
+    Conflict,
+    /// The last sync failed for a reason other than a conflict.
+    Error(String),
+}
+
 /// An action requested by a background service.
 #[derive(Debug, Clone)]
 pub enum Msg {
@@ -33,4 +49,8 @@ pub enum Msg {
     GitPush,
     /// Result of the last git push/pull, shown in preferences.
     GitResult(String),
+    /// Run a full sync now (pull → commit → push).
+    GitSync,
+    /// The sync state changed (updates the tray indicator).
+    SyncState(SyncState),
 }

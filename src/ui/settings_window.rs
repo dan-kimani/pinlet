@@ -33,6 +33,10 @@ pub struct SettingsCallbacks {
     pub on_git_remote: Box<dyn Fn(String)>,
     /// Git branch changed.
     pub on_git_branch: Box<dyn Fn(String)>,
+    /// Auto-commit interval (minutes) changed.
+    pub on_git_commit_interval: Box<dyn Fn(u64)>,
+    /// Auto-push interval (minutes) changed.
+    pub on_git_push_interval: Box<dyn Fn(u64)>,
     /// Pull the note repo from its remote.
     pub on_git_pull: Box<dyn Fn()>,
     /// Push the note repo to its remote.
@@ -49,6 +53,12 @@ const SAVE_DELAYS_MS: [u64; 4] = [500, 1000, 2000, 5000];
 
 /// Human-readable labels for the auto-save presets, matching [`SAVE_DELAYS_MS`].
 const SAVE_DELAY_LABELS: [&str; 4] = ["0.5 s", "1 s", "2 s", "5 s"];
+
+/// Auto-commit / auto-push interval presets, in minutes (0 = off).
+const SYNC_INTERVALS_MIN: [u64; 5] = [0, 1, 5, 15, 30];
+
+/// Human-readable labels for the sync interval presets.
+const SYNC_INTERVAL_LABELS: [&str; 5] = ["Off", "1 min", "5 min", "15 min", "30 min"];
 
 /// One settings window per application; shown and hidden on demand.
 pub struct SettingsWindow {
@@ -234,6 +244,22 @@ impl SettingsWindow {
             .build();
         git_group.add(&branch_row);
 
+        let commit_interval_row = ComboRow::builder()
+            .title("Auto-commit every")
+            .subtitle("Commit local changes on a timer while syncing")
+            .model(&gtk4::StringList::new(&SYNC_INTERVAL_LABELS))
+            .selected(sync_interval_index(settings.git_commit_interval_min))
+            .build();
+        git_group.add(&commit_interval_row);
+
+        let push_interval_row = ComboRow::builder()
+            .title("Push every")
+            .subtitle("Pull, commit, and push on a timer while syncing")
+            .model(&gtk4::StringList::new(&SYNC_INTERVAL_LABELS))
+            .selected(sync_interval_index(settings.git_push_interval_min))
+            .build();
+        git_group.add(&push_interval_row);
+
         let pull_row = ActionRow::builder()
             .title("Pull now")
             .subtitle("Fetch and fast-forward from the remote")
@@ -259,11 +285,15 @@ impl SettingsWindow {
         let apply_sync_state = {
             let remote_row = remote_row.clone();
             let branch_row = branch_row.clone();
+            let commit_interval_row = commit_interval_row.clone();
+            let push_interval_row = push_interval_row.clone();
             let pull_row = pull_row.clone();
             let push_row = push_row.clone();
             move |on: bool| {
                 remote_row.set_sensitive(on);
                 branch_row.set_sensitive(on);
+                commit_interval_row.set_sensitive(on);
+                push_interval_row.set_sensitive(on);
                 pull_row.set_sensitive(on);
                 push_row.set_sensitive(on);
             }
@@ -288,6 +318,18 @@ impl SettingsWindow {
             let callbacks = callbacks.clone();
             branch_row.connect_apply(move |row| {
                 (callbacks.on_git_branch)(row.text().to_string());
+            });
+        }
+        {
+            let callbacks = callbacks.clone();
+            commit_interval_row.connect_selected_notify(move |row| {
+                (callbacks.on_git_commit_interval)(SYNC_INTERVALS_MIN[row.selected() as usize]);
+            });
+        }
+        {
+            let callbacks = callbacks.clone();
+            push_interval_row.connect_selected_notify(move |row| {
+                (callbacks.on_git_push_interval)(SYNC_INTERVALS_MIN[row.selected() as usize]);
             });
         }
         {
@@ -335,6 +377,14 @@ fn selected_index(default_color: &str) -> u32 {
 /// Index of `ms` in the auto-save presets, falling back to the first.
 fn save_delay_index(ms: u64) -> u32 {
     SAVE_DELAYS_MS.iter().position(|&value| value == ms).unwrap_or(0) as u32
+}
+
+/// Index of `minutes` in the sync interval presets, falling back to Off.
+fn sync_interval_index(minutes: u64) -> u32 {
+    SYNC_INTERVALS_MIN
+        .iter()
+        .position(|&value| value == minutes)
+        .unwrap_or(0) as u32
 }
 
 /// Factory that renders a combo entry as a color swatch plus its

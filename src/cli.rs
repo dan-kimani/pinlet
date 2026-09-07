@@ -25,4 +25,6 @@ pub enum Command {
     },
     /// Print the note repository path (the git repo) and exit.
     Where,
+    /// Sync notes with the configured git remote (pull → commit → push).
+    Sync,
 }

@@ -70,9 +70,23 @@ impl GitRepo {
         run_git(Some(&self.dir), &["pull", "--ff-only", "origin", branch])
     }
 
+    /// Pull and merge from `origin`. Unlike [`GitRepo::pull`], this
+    /// will create a merge commit (or leave conflicts in the tree)
+    /// rather than refusing a diverged branch.
+    pub fn pull_merge(&self, branch: &str) -> AppResult<()> {
+        run_git(Some(&self.dir), &["pull", "origin", branch])
+    }
+
     /// Push to `origin` and set the upstream branch.
     pub fn push(&self, branch: &str) -> AppResult<()> {
         run_git(Some(&self.dir), &["push", "-u", "origin", branch])
+    }
+
+    /// Whether the index holds unmerged paths — i.e. a merge conflict
+    /// is waiting for manual resolution.
+    pub fn has_conflicts(&self) -> AppResult<bool> {
+        let out = run_git_capture(Some(&self.dir), &["ls-files", "-u"])?;
+        Ok(!out.trim().is_empty())
     }
 
     /// Keep machine-specific and sensitive files out of version

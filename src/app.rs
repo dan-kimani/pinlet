@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::cli;
 use crate::error::AppResult;
-use crate::messages::Msg;
+use crate::messages::{Msg, SyncState};
 use crate::pinning::PinBackend;
 use crate::settings::{Settings, SETTINGS_FILE};
 use crate::storage::{
@@ -96,6 +96,12 @@ struct AppInner {
     commit_source: RefCell<Option<SourceId>>,
     /// Message for the next auto-commit; the last change wins.
     commit_message: RefCell<String>,
+    /// Current git sync state, mirrored into the tray snapshot.
+    sync_state: RefCell<SyncState>,
+    /// Periodic auto-commit timer (sync feature).
+    sync_commit_source: RefCell<Option<SourceId>>,
+    /// Periodic auto-push (full sync) timer.
+    sync_push_source: RefCell<Option<SourceId>>,
     /// Reminder-check tick loop.
     tick_source: RefCell<Option<SourceId>>,
     /// Debounced geometry-save timer.
@@ -213,6 +219,9 @@ impl App {
             save_sources: RefCell::new(HashMap::new()),
             commit_source: RefCell::new(None),
             commit_message: RefCell::new(String::new()),
+            sync_state: RefCell::new(SyncState::default()),
+            sync_commit_source: RefCell::new(None),
+            sync_push_source: RefCell::new(None),
             tick_source: RefCell::new(None),
             geometry_source: RefCell::new(None),
             local_state: RefCell::new(local_state),
@@ -254,6 +263,7 @@ impl App {
                     .unwrap_or_else(|| self.default_color());
                 self.new_note(color, text.clone().unwrap_or_default());
             }
+            Some(cli::Command::Sync) => self.sync_now(),
             _ if self.inner.notes.borrow().is_empty() => {
                 self.new_note(self.default_color(), String::new());
             }
@@ -274,21 +284,36 @@ impl App {
             },
         )));
         self.refresh_tray_snapshot();
+
+        // Establish the sync indicator and start the timed commit/push
+        // loops. A configured remote pulls on launch to reflect the
+        // true sync state from the start.
+        self.reschedule_sync_timers();
+        let configured = self.sync_configured();
+        if configured {
+            self.sync_now();
+        } else {
+            self.set_sync_state(SyncState::Unconfigured);
+        }
     }
 
     /// Handle command-line arguments arriving at a running instance
     /// (GtkApplication remote activation / single-instance handoff).
     pub fn handle_command_line(&self, cli: &cli::Cli) {
-        if let Some(cli::Command::New { text, color }) = &cli.command {
-            let color = color
-                .as_deref()
-                .and_then(|raw| raw.parse().ok())
-                .unwrap_or_else(|| self.default_color());
-            self.new_note(color, text.clone().unwrap_or_default());
-        } else {
-            // Plain re-invocation: bring the notes forward.
-            for window in self.inner.windows.borrow().values() {
-                window.present();
+        match &cli.command {
+            Some(cli::Command::New { text, color }) => {
+                let color = color
+                    .as_deref()
+                    .and_then(|raw| raw.parse().ok())
+                    .unwrap_or_else(|| self.default_color());
+                self.new_note(color, text.clone().unwrap_or_default());
+            }
+            Some(cli::Command::Sync) => self.sync_now(),
+            _ => {
+                // Plain re-invocation: bring the notes forward.
+                for window in self.inner.windows.borrow().values() {
+                    window.present();
+                }
             }
         }
     }
@@ -353,6 +378,8 @@ impl App {
             Msg::GitPull => self.git_pull(),
             Msg::GitPush => self.git_push(),
             Msg::GitResult(message) => self.set_git_status(&message),
+            Msg::GitSync => self.sync_now(),
+            Msg::SyncState(state) => self.set_sync_state(state),
             Msg::Quit => {
                 self.flush_all();
                 self.inner.gtk_app.quit();
@@ -400,6 +427,133 @@ impl App {
     fn set_git_status(&self, message: &str) {
         if let Some(window) = self.inner.settings_window.borrow().as_ref() {
             window.set_git_status(message);
+        }
+    }
+
+    /// Whether sync is fully configured (enabled and a remote URL set).
+    fn sync_configured(&self) -> bool {
+        let settings = self.inner.settings.borrow();
+        settings.git_sync_enabled && !settings.git_remote_url.trim().is_empty()
+    }
+
+    /// Run a full sync: pull, commit, then push. No-op while a sync is
+    /// already in flight, and it warns instead when sync isn't set up.
+    fn sync_now(&self) {
+        if !self.sync_configured() {
+            self.set_sync_state(SyncState::Unconfigured);
+            self.notify_sync_warning(
+                "Sync is not set up yet. Enable it and set a Remote URL in Preferences.",
+            );
+            return;
+        }
+        if *self.inner.sync_state.borrow() == SyncState::Syncing {
+            return;
+        }
+        self.set_sync_state(SyncState::Syncing);
+
+        let repo = self.inner.repo.clone();
+        let (url, branch) = {
+            let settings = self.inner.settings.borrow();
+            (
+                settings.git_remote_url.trim().to_owned(),
+                settings.git_branch.clone(),
+            )
+        };
+        let commit_message = std::mem::take(&mut *self.inner.commit_message.borrow_mut());
+        let tx = self.inner.tx.clone();
+        std::thread::spawn(move || {
+            let outcome = run_sync(&repo, &url, &branch, &commit_message);
+            let _ = tx.send(Msg::SyncState(outcome));
+        });
+    }
+
+    /// Commit any pending local changes (periodic auto-commit).
+    fn commit_auto(&self) {
+        if !self.inner.settings.borrow().git_sync_enabled {
+            return;
+        }
+        let pending = std::mem::take(&mut *self.inner.commit_message.borrow_mut());
+        let message = if pending.is_empty() {
+            "Auto-commit".to_owned()
+        } else {
+            pending
+        };
+        if let Err(err) = self.inner.repo.commit_all(&message) {
+            eprintln!("auto-commit failed: {err}");
+        }
+    }
+
+    /// (Re)start the periodic commit and push timers to match the
+    /// current sync settings. Cancels both when sync is off.
+    fn reschedule_sync_timers(&self) {
+        if let Some(source) = self.inner.sync_commit_source.borrow_mut().take() {
+            cancel_source(source);
+        }
+        if let Some(source) = self.inner.sync_push_source.borrow_mut().take() {
+            cancel_source(source);
+        }
+        if !self.sync_configured() {
+            return;
+        }
+
+        let (commit_min, push_min) = {
+            let settings = self.inner.settings.borrow();
+            (
+                settings.git_commit_interval_min,
+                settings.git_push_interval_min,
+            )
+        };
+
+        if commit_min > 0 {
+            let this = self.clone();
+            let source = glib::timeout_add_local(Duration::from_secs(commit_min * 60), move || {
+                this.commit_auto();
+                ControlFlow::Continue
+            });
+            *self.inner.sync_commit_source.borrow_mut() = Some(source);
+        }
+        if push_min > 0 {
+            let this = self.clone();
+            let source = glib::timeout_add_local(Duration::from_secs(push_min * 60), move || {
+                this.sync_now();
+                ControlFlow::Continue
+            });
+            *self.inner.sync_push_source.borrow_mut() = Some(source);
+        }
+    }
+
+    /// Record a sync-state change, mirroring it to the tray and the
+    /// preferences status line.
+    fn set_sync_state(&self, state: SyncState) {
+        *self.inner.sync_state.borrow_mut() = state.clone();
+        if let Ok(mut snapshot) = self.inner.tray_snapshot.lock() {
+            snapshot.sync = state.clone();
+        }
+        self.set_git_status(&sync_state_text(&state));
+    }
+
+    /// React to a sync-related setting change: reschedule timers and
+    /// re-derive the indicator.
+    fn sync_settings_changed(&self) {
+        self.reschedule_sync_timers();
+        if !self.sync_configured() {
+            self.set_sync_state(SyncState::Unconfigured);
+        } else if *self.inner.sync_state.borrow() == SyncState::Unconfigured {
+            // Just became configured — run an initial sync.
+            self.sync_now();
+        }
+    }
+
+    /// Surface a sync warning as a desktop notification.
+    fn notify_sync_warning(&self, message: &str) {
+        if let Err(err) = notify_rust::Notification::new()
+            .appname("Pinlet")
+            .summary("Pinlet sync")
+            .body(message)
+            .timeout(notify_rust::Timeout::Milliseconds(8_000))
+            .show()
+        {
+            eprintln!("notification failed: {err}");
         }
     }
 
@@ -1038,15 +1192,38 @@ impl App {
                     }),
                     on_git_sync: Box::new({
                         let this = self.clone();
-                        move |value| this.set_setting(|settings| settings.git_sync_enabled = value)
+                        move |value| {
+                            this.set_setting(|settings| settings.git_sync_enabled = value);
+                            this.sync_settings_changed();
+                        }
                     }),
                     on_git_remote: Box::new({
                         let this = self.clone();
-                        move |value| this.set_setting(|settings| settings.git_remote_url = value)
+                        move |value| {
+                            this.set_setting(|settings| settings.git_remote_url = value);
+                            this.sync_settings_changed();
+                        }
                     }),
                     on_git_branch: Box::new({
                         let this = self.clone();
-                        move |value| this.set_setting(|settings| settings.git_branch = value)
+                        move |value| {
+                            this.set_setting(|settings| settings.git_branch = value);
+                            this.sync_settings_changed();
+                        }
+                    }),
+                    on_git_commit_interval: Box::new({
+                        let this = self.clone();
+                        move |value| {
+                            this.set_setting(|settings| settings.git_commit_interval_min = value);
+                            this.sync_settings_changed();
+                        }
+                    }),
+                    on_git_push_interval: Box::new({
+                        let this = self.clone();
+                        move |value| {
+                            this.set_setting(|settings| settings.git_push_interval_min = value);
+                            this.sync_settings_changed();
+                        }
                     }),
                     on_git_pull: Box::new({
                         let this = self.clone();
@@ -1189,6 +1366,55 @@ impl App {
         }
         self.save_geometry();
         self.commit_now();
+    }
+}
+
+/// Run the sync git sequence (pull → commit → push) and report the
+/// resulting state. A fast-forward-only pull runs first; on a diverged
+/// remote the local changes are committed, the remote is merged, and the
+/// push is retried, surfacing a merge conflict rather than a hard error.
+fn run_sync(repo: &GitRepo, url: &str, branch: &str, commit_message: &str) -> SyncState {
+    let fallback = if commit_message.is_empty() {
+        "Sync"
+    } else {
+        commit_message
+    };
+
+    if let Err(err) = repo.configure_sync(url, branch) {
+        return SyncState::Error(err.to_string());
+    }
+
+    // Pull fast-forwardable changes first; a failure here is expected on a
+    // fresh remote (no branch yet) or a divergence, both handled below.
+    let _ = repo.pull(branch);
+
+    if let Err(err) = repo.commit_all(fallback) {
+        return SyncState::Error(err.to_string());
+    }
+
+    match repo.push(branch) {
+        Ok(()) => SyncState::InSync,
+        Err(_) => match repo.pull_merge(branch) {
+            Ok(()) => match repo.push(branch) {
+                Ok(()) => SyncState::InSync,
+                Err(err) => SyncState::Error(err.to_string()),
+            },
+            Err(merge_err) => match repo.has_conflicts() {
+                Ok(true) => SyncState::Conflict,
+                _ => SyncState::Error(merge_err.to_string()),
+            },
+        },
+    }
+}
+
+/// Human-readable status for the preferences window.
+fn sync_state_text(state: &SyncState) -> String {
+    match state {
+        SyncState::Unconfigured => "Sync is not set up — configure a Remote URL.".to_owned(),
+        SyncState::Syncing => "Syncing…".to_owned(),
+        SyncState::InSync => "Notes are in sync.".to_owned(),
+        SyncState::Conflict => "Merge conflict — resolve it in the note repository.".to_owned(),
+        SyncState::Error(err) => format!("Sync failed: {err}"),
     }
 }
 

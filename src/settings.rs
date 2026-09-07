@@ -37,6 +37,10 @@ pub struct Settings {
     pub git_remote_url: String,
     /// Branch to push and pull.
     pub git_branch: String,
+    /// Minutes between automatic local commits while syncing (0 = off).
+    pub git_commit_interval_min: u64,
+    /// Minutes between automatic pushes (full syncs) while syncing (0 = off).
+    pub git_push_interval_min: u64,
 }
 
 impl Default for Settings {
@@ -52,6 +56,8 @@ impl Default for Settings {
             git_sync_enabled: false,
             git_remote_url: String::new(),
             git_branch: "main".to_owned(),
+            git_commit_interval_min: 5,
+            git_push_interval_min: 15,
         }
     }
 }

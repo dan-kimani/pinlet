@@ -16,7 +16,7 @@ use ksni::menu::{StandardItem, SubMenu};
 use ksni::{Icon, MenuItem, Tray};
 use uuid::Uuid;
 
-use crate::messages::Msg;
+use crate::messages::{Msg, SyncState};
 
 /// The app icon, rendered to ARGB32 for the tray. Embedded so the tray
 /// shows the real icon even in a dev build where the icon is not yet
@@ -115,6 +115,8 @@ pub struct DueReminder {
 pub struct TraySnapshot {
     /// Upcoming reminders, sorted by due time.
     pub upcoming: Vec<DueReminder>,
+    /// Git sync status for the sync menu item.
+    pub sync: SyncState,
 }
 
 /// The ksni tray handle type.
@@ -178,6 +180,28 @@ impl PinletTray {
             ..Default::default()
         })
     }
+
+    /// The sync entry: a colored dot plus a label reflecting the current
+    /// [`SyncState`]. Clicking always requests a sync; the app core
+    /// warns when the remote isn't configured yet.
+    fn sync_item(state: &SyncState, tx: &MsgSender<Msg>) -> MenuItem<Self> {
+        let (label, icon) = match state {
+            SyncState::Unconfigured => ("⚪ Sync — set remote URL", "dialog-warning-symbolic"),
+            SyncState::Syncing => ("🟡 Syncing…", "content-loading-symbolic"),
+            SyncState::InSync => ("🟢 Sync", "emblem-ok-symbolic"),
+            SyncState::Conflict => ("🔴 Sync — merge conflict", "dialog-error-symbolic"),
+            SyncState::Error(_) => ("🔴 Sync failed", "dialog-error-symbolic"),
+        };
+        let tx = tx.clone();
+        MenuItem::Standard(StandardItem {
+            label: label.to_owned(),
+            icon_name: icon.to_owned(),
+            activate: Box::new(move |_| {
+                let _ = tx.send(Msg::GitSync);
+            }),
+            ..Default::default()
+        })
+    }
 }
 
 impl Tray for PinletTray {
@@ -217,8 +241,12 @@ impl Tray for PinletTray {
         items.push(Self::item("New note", "list-add-symbolic", Msg::NewNote, &self.tx));
         items.push(Self::item("Show / hide all", "view-restore-symbolic", Msg::ToggleAll, &self.tx));
 
-        // Dynamic section: top 5 upcoming reminders (spec §3.3).
+        // Sync status: pull → commit → push on click (spec §3.1).
         let snapshot = self.snapshot.lock().expect("tray snapshot poisoned").clone();
+        items.push(MenuItem::Separator);
+        items.push(Self::sync_item(&snapshot.sync, &self.tx));
+
+        // Dynamic section: top 5 upcoming reminders (spec §3.3).
         if !snapshot.upcoming.is_empty() {
             items.push(MenuItem::Separator);
             for reminder in &snapshot.upcoming {
