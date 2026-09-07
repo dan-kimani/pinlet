@@ -1,16 +1,15 @@
-//! Markdown rendering for the note body.
+//! Markdown rendering for the note preview.
 //!
-//! The buffer always holds canonical Markdown source; this module styles it
-//! so it *reads* as formatted text. Formatting markers (`**`, `# `, `` ` ``,
-//! `~~`, `- ` bullets) are hidden with an `invisible` tag, while the content
-//! is styled with GTK text tags (bold, italic, headings, code, …). Because the
-//! markers stay in the buffer, saving is a straight copy and nothing is lost.
-
-use std::cell::RefCell;
+//! The note editor shows the raw Markdown source; a separate read-only preview
+//! renders it. `source_to_preview` turns task-list checkboxes into ☐/☑ glyphs,
+//! and `MarkdownStyler` styles the text with GTK text tags (bold, italic,
+//! headings, code, lists, block quotes), hiding the `**`/`# ` markers with an
+//! `invisible` tag. The preview is never edited, so no cursor or round-trip
+//! concerns arise.
 
 use gtk4::pango;
 use gtk4::prelude::*;
-use gtk4::{CheckButton, TextBuffer, TextChildAnchor, TextTag, TextView};
+use gtk4::{TextBuffer, TextTag};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 const OPTIONS: Options = Options::ENABLE_TASKLISTS.union(Options::ENABLE_STRIKETHROUGH);
@@ -91,7 +90,6 @@ fn compute_styles(text: &str) -> Vec<Span> {
     let mut list_depth: usize = 0;
     let mut item_start: Option<usize> = None;
     let mut item_depth: usize = 0;
-    let mut item_is_checkbox: bool = false;
     let mut item_indent_done: bool = false;
 
     for (event, range) in Parser::new_ext(text, OPTIONS).into_offset_iter() {
@@ -143,7 +141,6 @@ fn compute_styles(text: &str) -> Vec<Span> {
                 Tag::Item => {
                     item_start = Some(s);
                     item_depth = list_depth;
-                    item_is_checkbox = false;
                     item_indent_done = false;
                 }
                 _ => {}
@@ -181,7 +178,7 @@ fn compute_styles(text: &str) -> Vec<Span> {
             Event::Text(_) => {
                 if let Some(item) = item_start {
                     if !item_indent_done {
-                        emit_item_marker(&mut spans, item, s, e, item_depth, item_is_checkbox);
+                        emit_item_marker(&mut spans, item, s, e, item_depth);
                         item_indent_done = true;
                     }
                 }
@@ -202,7 +199,7 @@ fn compute_styles(text: &str) -> Vec<Span> {
                 let ce = e - n;
                 if let Some(item) = item_start {
                     if !item_indent_done {
-                        emit_item_marker(&mut spans, item, cs, ce, item_depth, item_is_checkbox);
+                        emit_item_marker(&mut spans, item, cs, ce, item_depth);
                         item_indent_done = true;
                     }
                 }
@@ -219,14 +216,6 @@ fn compute_styles(text: &str) -> Vec<Span> {
                     spans.push(Span::style(cs, ce, active.style));
                 }
             }
-            Event::TaskListMarker(_) => {
-                // Hide the whole `- [x]` marker; a CheckButton widget renders
-                // in its place (managed separately in `sync_checkboxes`).
-                if let Some(item) = item_start {
-                    spans.push(Span::hide(item, e));
-                }
-                item_is_checkbox = true;
-            }
             _ => {}
         }
     }
@@ -242,14 +231,13 @@ fn emit_item_marker(
     content_start: usize,
     content_end: usize,
     depth: usize,
-    is_checkbox: bool,
 ) {
     if depth >= 2 {
         // `left-margin` is paragraph-level, so tagging any range inside the
         // item indents the whole paragraph.
         spans.push(Span::style(content_start, content_end, Style::Indent(depth)));
     }
-    if !is_checkbox && content_start > item_start {
+    if content_start > item_start {
         spans.push(Span::style(item_start, content_start, Style::ListMarker));
     }
 }
@@ -361,45 +349,24 @@ impl MarkdownTags {
     }
 }
 
-/// A checkbox widget embedded in the buffer at a task-list marker.
-struct ManagedCheckbox {
-    /// Retained so the anchor (and its position in the buffer) lives as long
-    /// as the widget; enables future stale-widget cleanup via `is_deleted`.
-    #[allow(dead_code)]
-    anchor: TextChildAnchor,
-    button: CheckButton,
-}
-
-/// Styles a note body's buffer on demand.
+/// Styles a note preview buffer on demand.
 pub struct MarkdownStyler {
     tags: MarkdownTags,
-    /// Embedded checkbox widgets, in document order.
-    checkboxes: RefCell<Vec<ManagedCheckbox>>,
-    /// Checked states from the last sync, to skip no-op work.
-    checkbox_states: RefCell<Vec<bool>>,
 }
 
 impl MarkdownStyler {
     /// Create the styler for `buffer`, registering its tags once.
     pub fn new(buffer: &TextBuffer) -> Self {
         let tags = MarkdownTags::new(&buffer.tag_table());
-        Self {
-            tags,
-            checkboxes: RefCell::new(Vec::new()),
-            checkbox_states: RefCell::new(Vec::new()),
-        }
+        Self { tags }
     }
 
     /// Re-render the buffer's Markdown source: clear prior styling, then
-    /// re-parse and re-apply tags, and sync the embedded checkbox widgets.
-    /// Only touches tags and widgets, never the text.
-    pub fn restyle(&self, text_view: &TextView) {
-        let buffer = text_view.buffer();
+    /// re-parse and re-apply tags. Only touches tags, never the text, so it is
+    /// safe to call on a read-only preview buffer.
+    pub fn restyle(&self, buffer: &TextBuffer) {
         let start = buffer.start_iter();
         let end = buffer.end_iter();
-        // `true` keeps the hidden marker characters so the Markdown re-parses
-        // from the canonical source (with `false`, GTK drops the invisible
-        // markers and the next pass misreads the text).
         let text = buffer.text(&start, &end, true).to_string();
 
         for tag in self.tags.all() {
@@ -420,126 +387,32 @@ impl MarkdownStyler {
                 buffer.apply_tag(tag, &tag_start, &tag_end);
             }
         }
-
-        self.sync_checkboxes(text_view, &buffer, &text);
-    }
-
-    /// Reconcile the embedded CheckButton widgets with the current task
-    /// markers. Anchors track the buffer as text is edited, so this only
-    /// rebuilds when a checkbox is added, removed, or toggled.
-    fn sync_checkboxes(&self, text_view: &TextView, buffer: &TextBuffer, text: &str) {
-        let infos = compute_checkboxes(text);
-        let states: Vec<bool> = infos.iter().map(|info| info.checked).collect();
-
-        let mut managed = self.checkboxes.borrow_mut();
-        let mut previous = self.checkbox_states.borrow_mut();
-
-        if states == *previous {
-            return;
-        }
-
-        if managed.len() == infos.len() {
-            // Same count: only a state changed (a click or Ctrl+Enter). Update
-            // in place so the clicked button is never destroyed mid-signal.
-            for (managed, info) in managed.iter().zip(&infos) {
-                if managed.button.is_active() != info.checked {
-                    managed.button.set_active(info.checked);
-                }
-            }
-        } else {
-            // Count changed: rebuild from scratch.
-            for managed in managed.drain(..) {
-                managed.button.unparent();
-            }
-            let char_of = char_offsets(text);
-            for info in &infos {
-                let mut iter = buffer.iter_at_offset(char_of[info.item_start] as i32);
-                let anchor = buffer.create_child_anchor(&mut iter);
-                let button = CheckButton::new();
-                button.set_active(info.checked);
-                button.add_css_class("pinlet-checkbox");
-                text_view.add_child_at_anchor(&button, &anchor);
-                self.connect_checkbox(&button, &anchor, buffer);
-                managed.push(ManagedCheckbox { anchor, button });
-            }
-        }
-
-        *previous = states;
-    }
-
-    /// Wire a checkbox's toggle to the source `[ ]`/`[x]` glyph.
-    fn connect_checkbox(&self, button: &CheckButton, anchor: &TextChildAnchor, buffer: &TextBuffer) {
-        let anchor = anchor.clone();
-        let buffer = buffer.clone();
-        button.connect_toggled(move |button| {
-            set_checkbox_source(&buffer, &anchor, button.is_active());
-        });
     }
 }
 
-/// A task-list checkbox in the source.
-struct CheckboxInfo {
-    /// Byte offset of the item's `-` (where the widget is anchored).
-    item_start: usize,
-    checked: bool,
-}
-
-/// Find every task-list checkbox, in document order.
-fn compute_checkboxes(text: &str) -> Vec<CheckboxInfo> {
-    let mut infos = Vec::new();
+/// Convert canonical Markdown source into preview text: task-list checkboxes
+/// (`- [ ]` / `- [x]`) become ☐/☑ glyphs, with the list bullet dropped. The
+/// preview is read-only, so a plain text transform is safe (no round-trip).
+pub fn source_to_preview(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut last = 0;
     let mut item_start: Option<usize> = None;
-    for (event, range) in Parser::new_ext(text, OPTIONS).into_offset_iter() {
+    for (event, range) in Parser::new_ext(source, OPTIONS).into_offset_iter() {
         match event {
             Event::Start(Tag::Item) => item_start = Some(range.start),
             Event::TaskListMarker(checked) => {
                 if let Some(item) = item_start {
-                    infos.push(CheckboxInfo { item_start: item, checked });
+                    out.push_str(&source[last..item]);
+                    out.push(if checked { '☑' } else { '☐' });
+                    last = range.end;
                 }
             }
             Event::End(TagEnd::Item) => item_start = None,
             _ => {}
         }
     }
-    infos
-}
-
-/// Set the checkbox glyph on the anchor's line to `x` (checked) or a space.
-/// Idempotent: a no-op when the source already matches, so a programmatic
-/// `set_active` during sync doesn't echo back into a source edit.
-fn set_checkbox_source(buffer: &TextBuffer, anchor: &TextChildAnchor, checked: bool) {
-    let line = buffer.iter_at_child_anchor(anchor).line();
-    let Some(mut start) = buffer.iter_at_line(line) else {
-        return;
-    };
-    let Some(end) = buffer.iter_at_line(line + 1) else {
-        return;
-    };
-    let text = buffer.text(&start, &end, true).to_string();
-    let Some((offset, current)) = checkbox_offset(&text) else {
-        return;
-    };
-    if current == checked {
-        return;
-    }
-    let replacement = if checked { "x" } else { " " };
-    start.forward_chars(offset as i32);
-    let mut glyph_end = start;
-    glyph_end.forward_char();
-    buffer.begin_user_action();
-    buffer.delete(&mut start, &mut glyph_end);
-    buffer.insert(&mut start, replacement);
-    buffer.end_user_action();
-}
-
-/// If the line has a checkbox (`- [ ]` / `- [x]`), return the char offset of
-/// the state glyph and whether it is checked.
-pub(crate) fn checkbox_offset(line: &str) -> Option<(usize, bool)> {
-    let rest = line.strip_prefix("- [")?;
-    match rest.chars().next() {
-        Some(' ') => Some((3, false)),
-        Some('x') | Some('X') => Some((3, true)),
-        _ => None,
-    }
+    out.push_str(&source[last..]);
+    out
 }
 
 /// Prefix array mapping byte offsets to character (codepoint) offsets.
@@ -597,23 +470,14 @@ mod tests {
     }
 
     #[test]
-    fn checkbox_hides_bullet() {
-        let text = "- [x] done\n";
-        let spans = compute_styles(text);
-        // Hide the whole `- [x]` marker (0..5); a CheckButton renders in its
-        // place.
-        assert!(spans.contains(&hide(0, 5)));
-    }
-
-    #[test]
-    fn compute_checkboxes_finds_tasks() {
-        let text = "- [ ] open\n- [x] done\n";
-        let infos = compute_checkboxes(text);
-        assert_eq!(infos.len(), 2);
-        assert!(!infos[0].checked);
-        assert!(infos[1].checked);
-        assert_eq!(infos[0].item_start, 0);
-        assert_eq!(infos[1].item_start, 11);
+    fn source_to_preview_renders_checkboxes() {
+        // Task-list checkboxes become ☐/☑, dropping the `- ` bullet.
+        assert_eq!(
+            source_to_preview("- [ ] open\n- [x] done\n"),
+            "☐ open\n☑ done\n"
+        );
+        // Brackets that aren't a task list are left untouched.
+        assert_eq!(source_to_preview("note [x] text\n"), "note [x] text\n");
     }
 
     #[test]

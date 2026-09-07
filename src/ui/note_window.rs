@@ -15,11 +15,11 @@ use crate::timer::cancel_source;
 use crate::ui::x11;
 use gtk4::{
     Button, FlowBox, HeaderBar, Label, ListBox, ListBoxRow, MenuButton, Orientation, Popover,
-    ScrolledWindow, TextBuffer, TextIter, TextWindowType, TextView,
+    ScrolledWindow, Stack, TextBuffer, TextView, ToggleButton,
 };
 
 use crate::app::SharedNote;
-use crate::markdown::{checkbox_offset, MarkdownStyler};
+use crate::markdown::{source_to_preview, MarkdownStyler};
 use crate::pinning::PinBackend;
 use crate::storage::{NoteColor, Recurrence, Reminder, WindowGeometry};
 use crate::ui::colors;
@@ -132,9 +132,16 @@ impl NoteWindow {
             window.set_exclusive_zone(0);
         }
 
-        // Header bar with quick actions.
-        let header = HeaderBar::builder().show_title_buttons(true).build();
+        // Header bar with quick actions. Window controls (min/max/close) are
+        // disabled: GTK appends them to the far right *after* the packed
+        // buttons, which would push `delete` off the right edge. The note is
+        // still closable via the tray or Alt+F4.
+        let header = HeaderBar::builder().show_title_buttons(false).build();
         header.add_css_class("pinlet-header");
+        // The window title is kept for the task switcher, but the header stays
+        // lean: an empty title widget suppresses the header's built-in title.
+        header.set_title_widget(Some(&Label::new(None)));
+
 
         let new_btn = Button::from_icon_name("list-add-symbolic");
         new_btn.set_tooltip_text(Some("New note"));
@@ -143,30 +150,41 @@ impl NoteWindow {
             new_btn.connect_clicked(move |_| (callbacks.on_new)());
         }
 
-        // Inline color palette: a popover of swatches.
+        // Inline color palette: a popover of swatches. Swatches are Boxes,
+        // not Buttons — a Button draws its own theme background over
+        // `background-color`, which leaves the swatches looking black.
         let popover = Popover::new();
         let palette = FlowBox::builder()
             .max_children_per_line(3)
             .selection_mode(gtk4::SelectionMode::None)
             .build();
         for swatch_color in NoteColor::PALETTE {
-            let swatch = Button::builder()
+            let swatch = gtk4::Box::builder()
                 .width_request(32)
                 .height_request(32)
                 .tooltip_text(swatch_color.name())
                 .build();
             swatch.add_css_class(swatch_color.css_class());
-            let shared = shared.clone();
-            let window = window.clone();
-            let callbacks = callbacks.clone();
-            swatch.connect_clicked(move |_| {
-                shared.note.borrow_mut().color = swatch_color.clone();
-                window.set_css_classes(&[swatch_color.css_class()]);
-                // Clone the body and drop the borrow before calling
-                // out: on_changed writes back into `shared.body`.
-                let body = shared.body.borrow().clone();
-                (callbacks.on_changed)(body);
-            });
+            swatch.add_css_class("pinlet-swatch");
+            let click = gtk4::GestureClick::new();
+            {
+                let shared = shared.clone();
+                let window = window.clone();
+                let callbacks = callbacks.clone();
+                let swatch_color = swatch_color.clone();
+                click.connect_released(move |_, n_press, _, _| {
+                    if n_press != 1 {
+                        return;
+                    }
+                    shared.note.borrow_mut().color = swatch_color.clone();
+                    window.set_css_classes(&[swatch_color.css_class()]);
+                    // Clone the body and drop the borrow before calling
+                    // out: on_changed writes back into `shared.body`.
+                    let body = shared.body.borrow().clone();
+                    (callbacks.on_changed)(body);
+                });
+            }
+            swatch.add_controller(click);
             palette.insert(&swatch, -1);
         }
         popover.set_child(Some(&palette));
@@ -258,12 +276,20 @@ impl NoteWindow {
             lock_btn.connect_clicked(move |_| (callbacks.on_lock_requested)());
         }
 
-        header.pack_end(&delete_btn);
-        header.pack_end(&pin_btn);
-        header.pack_end(&lock_btn);
-        header.pack_end(&reminder_btn);
-        header.pack_start(&color_btn);
+        // Edit/Preview toggle: an eye icon. Open eye = preview, closed = edit.
+        // Created here so it can sit in the header's action order; its toggled
+        // handler is wired up later, once the edit/preview views exist.
+        let preview_toggle = ToggleButton::new();
+        preview_toggle.set_icon_name("view-conceal-symbolic");
+        preview_toggle.set_tooltip_text(Some("Preview"));
+
         header.pack_start(&new_btn);
+        header.pack_end(&delete_btn);
+        header.pack_end(&lock_btn);
+        header.pack_end(&pin_btn);
+        header.pack_end(&preview_toggle);
+        header.pack_end(&reminder_btn);
+        header.pack_end(&color_btn);
 
         // Pinned windows have no window manager, so the header
         // doubles as a drag handle: layer margins or the X11
@@ -344,91 +370,90 @@ impl NoteWindow {
             header.add_controller(drag);
         }
 
-        // Markdown body.
-        let text_view = TextView::builder()
+        // Edit mode: the raw Markdown source. Preview mode: a read-only render.
+        let edit_view = TextView::builder()
             .wrap_mode(gtk4::WrapMode::WordChar)
             .top_margin(8)
             .bottom_margin(8)
             .left_margin(12)
             .right_margin(12)
             .build();
-        text_view.add_css_class("pinlet-body");
+        edit_view.add_css_class("pinlet-body");
+
+        let preview_view = TextView::builder()
+            .wrap_mode(gtk4::WrapMode::WordChar)
+            .top_margin(8)
+            .bottom_margin(8)
+            .left_margin(12)
+            .right_margin(12)
+            .editable(false)
+            .cursor_visible(false)
+            .build();
+        preview_view.add_css_class("pinlet-body");
+        let styler = MarkdownStyler::new(&preview_view.buffer());
+
         if locked {
-            text_view.set_editable(false);
-            text_view.buffer().set_text(
+            edit_view.set_editable(false);
+            edit_view.buffer().set_text(
                 "🔒 This note is locked.\n\n\
                  Unlock it with the lock button to view and edit its contents.",
             );
         } else {
-            text_view.buffer().set_text(&shared.body.borrow());
+            edit_view.buffer().set_text(&shared.body.borrow());
         }
 
-        // WYSIWYG Markdown: the buffer keeps the canonical source while the
-        // styler hides markers and applies formatting tags.
-        let styler = MarkdownStyler::new(&text_view.buffer());
-        if !locked {
-            styler.restyle(&text_view);
-        }
-
+        // The editor holds the canonical source: saving is a straight copy.
         {
             let callbacks = callbacks.clone();
-            let buffer = text_view.buffer();
-            let text_view = text_view.clone();
+            let buffer = edit_view.buffer();
             buffer.connect_changed(move |buffer| {
-                // `true` includes the hidden markers, so the saved body stays
-                // the canonical Markdown source.
                 let text = buffer
                     .text(&buffer.start_iter(), &buffer.end_iter(), true)
                     .to_string();
                 (callbacks.on_changed)(text);
-
-                // Re-render synchronously so the formatted view never lags the
-                // text. A debounce makes markers flicker as the raw source and
-                // the styled view trade places between keystrokes. Tag-only, so
-                // it cannot re-enter the `changed` signal.
-                styler.restyle(&text_view);
             });
         }
 
-        // Interactive checklists (spec §3.2): a click on a checkbox
-        // glyph toggles it.
-        let click = gtk4::GestureClick::new();
+        // Toggle between the raw editor and the rendered preview.
+        let stack = Stack::new();
+        stack.add_named(&edit_view, Some("edit"));
+        stack.add_named(&preview_view, Some("preview"));
+        stack.set_visible_child(&edit_view);
+
+        // Wire the eye toggle to the edit/preview views now that they exist.
         {
-            let text_view = text_view.clone();
-            click.connect_pressed(move |_gesture, _n_press, x, y| {
-                if let Some((iter, _trailing)) = text_view.iter_at_position(x as i32, y as i32) {
-                    let buffer = text_view.buffer();
-                    let _ = toggle_checkbox_at(&text_view, &buffer, &iter, Some(x));
+            let edit_view = edit_view.clone();
+            let preview_view = preview_view.clone();
+            let stack = stack.clone();
+            preview_toggle.connect_toggled(move |button| {
+                if button.is_active() {
+                    button.set_icon_name("view-reveal-symbolic");
+                    button.set_tooltip_text(Some("Edit"));
+                    let source = edit_view
+                        .buffer()
+                        .text(
+                            &edit_view.buffer().start_iter(),
+                            &edit_view.buffer().end_iter(),
+                            true,
+                        )
+                        .to_string();
+                    let preview = source_to_preview(&source);
+                    preview_view.buffer().set_text(&preview);
+                    styler.restyle(&preview_view.buffer());
+                    stack.set_visible_child(&preview_view);
+                } else {
+                    button.set_icon_name("view-conceal-symbolic");
+                    button.set_tooltip_text(Some("Preview"));
+                    stack.set_visible_child(&edit_view);
                 }
             });
         }
-        text_view.add_controller(click);
 
-        // Ctrl+Enter toggles the checkbox on the cursor line.
-        let keys = gtk4::EventControllerKey::new();
-        {
-            let text_view = text_view.clone();
-            keys.connect_key_pressed(move |_, keyval, _code, state| {
-                if keyval == gdk::Key::Return
-                    && state.contains(gdk::ModifierType::CONTROL_MASK)
-                {
-                    let buffer = text_view.buffer();
-                    let cursor = buffer.iter_at_offset(buffer.cursor_position());
-                    if toggle_checkbox_at(&text_view, &buffer, &cursor, None) {
-                        return glib::Propagation::Stop;
-                    }
-                }
-                glib::Propagation::Proceed
-            });
-        }
-        text_view.add_controller(keys);
-
-        // Drag & drop (spec §3.6): text and file URIs append to the
-        // note, images become Markdown image links.
-        // STRING-derived formats cover text/plain and text/uri-list.
+        // Drag & drop appends to the editor (which holds the editable
+        // source), turning file URIs into Markdown links.
         let drop_target = gtk4::DropTarget::new(glib::Type::STRING, gdk::DragAction::COPY);
         {
-            let buffer = text_view.buffer();
+            let buffer = edit_view.buffer();
             drop_target.connect_drop(move |_target, value, _x, _y| {
                 if let Ok(text) = value.get::<String>() {
                     append_drop(&buffer, &text);
@@ -437,10 +462,10 @@ impl NoteWindow {
                 false
             });
         }
-        text_view.add_controller(drop_target);
+        edit_view.add_controller(drop_target);
 
         let scroller = ScrolledWindow::builder()
-            .child(&text_view)
+            .child(&stack)
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .vexpand(true)
             .build();
@@ -677,52 +702,6 @@ fn format_reminder(reminder: &Reminder) -> String {
         Recurrence::Weekdays => format!("{when} · weekdays"),
         Recurrence::Custom(n) => format!("{when} · every {n} d"),
     }
-}
-
-/// Toggle the checkbox on `iter`'s line, if the line has one and the
-/// click (when given) landed on the glyph itself.
-fn toggle_checkbox_at(
-    view: &TextView,
-    buffer: &TextBuffer,
-    iter: &TextIter,
-    click_x: Option<f64>,
-) -> bool {
-    let line = iter.line();
-    let Some(mut start) = buffer.iter_at_line(line) else {
-        return false;
-    };
-    let Some(end) = buffer.iter_at_line(line + 1) else {
-        return false;
-    };
-    // Include hidden markers so `- [ ]` still matches despite the bullet.
-    let text = buffer.text(&start, &end, true).to_string();
-    let Some((offset, is_checked)) = checkbox_offset(&text) else {
-        return false;
-    };
-
-    // Only toggle when the click landed on the glyph; keyboard
-    // toggles pass `None` and always apply.
-    if let Some(x) = click_x {
-        let mut glyph = start;
-        glyph.forward_chars(offset as i32);
-        let rect = view.iter_location(&glyph);
-        let (glyph_x, _) = view.buffer_to_window_coords(TextWindowType::Text, rect.x(), rect.y());
-        if x < f64::from(glyph_x) - 6.0
-            || x > f64::from(glyph_x) + f64::from(rect.width()) + 6.0
-        {
-            return false;
-        }
-    }
-
-    let replacement = if is_checked { " " } else { "x" };
-    start.forward_chars(offset as i32);
-    let mut glyph_end = start;
-    glyph_end.forward_char();
-    buffer.begin_user_action();
-    buffer.delete(&mut start, &mut glyph_end);
-    buffer.insert(&mut start, replacement);
-    buffer.end_user_action();
-    true
 }
 
 /// Append dropped text to the end of the buffer: image file URIs

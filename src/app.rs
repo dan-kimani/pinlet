@@ -1218,14 +1218,12 @@ mod tests {
 
     /// The Markdown styler must keep the hidden formatting markers in the
     /// buffer's canonical source. Reading with `include_hidden_chars = false`
-    /// drops them, which both corrupts saved notes and makes the markers
-    /// flicker as the source and styled states trade places (regression).
+    /// drops them (regression).
     fn markdown_source_roundtrip() {
-        let view = gtk4::TextView::new();
-        let buffer = view.buffer();
+        let buffer = gtk4::TextBuffer::new(None);
         buffer.set_text("## Header\n\n**bold** and *italic*");
         let styler = crate::markdown::MarkdownStyler::new(&buffer);
-        styler.restyle(&view);
+        styler.restyle(&buffer);
 
         let start = buffer.start_iter();
         let end = buffer.end_iter();

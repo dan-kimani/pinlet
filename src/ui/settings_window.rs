@@ -8,7 +8,7 @@ use adw::{
     ActionRow, ComboRow, EntryRow, PreferencesGroup, PreferencesPage, PreferencesWindow, SwitchRow,
 };
 use gtk4::gio;
-use gtk4::{CheckButton, Label, Orientation, PasswordEntry, SignalListItemFactory};
+use gtk4::{Label, Orientation, PasswordEntry, SignalListItemFactory};
 
 use crate::settings::Settings;
 use crate::storage::NoteColor;
@@ -75,56 +75,27 @@ impl SettingsWindow {
         let window = PreferencesWindow::builder()
             .application(app)
             .title("Preferences")
+            .search_enabled(false)
             .default_width(480)
             .default_height(520)
             .build();
-        // Scopes the preferences-only CSS rules (see style.css).
-        window.add_css_class("pinlet-settings");
 
         // One page, grouped by concern (spec §3.5).
         let page = PreferencesPage::builder().build();
-        page.set_margin_top(12);
-        page.set_margin_bottom(24);
-        page.set_margin_start(12);
-        page.set_margin_end(12);
 
         let appearance_group = PreferencesGroup::builder().title("Appearance").build();
 
-        // Note color mode: a radio pair (spec Mode A vs Mode B).
-        let per_note_cb = CheckButton::builder().build();
-        let uniform_cb = CheckButton::builder().build();
-        uniform_cb.set_group(Some(&per_note_cb));
-        per_note_cb.set_active(!settings.force_global_color);
-        uniform_cb.set_active(settings.force_global_color);
-
-        let per_note_row = ActionRow::builder()
-            .title("Per-note colors")
-            .subtitle("Each note keeps its own color")
-            .activatable_widget(&per_note_cb)
-            .build();
-        pad_row(&per_note_row);
-        {
-            let callbacks = callbacks.clone();
-            per_note_cb.connect_toggled(move |cb| {
-                if cb.is_active() {
-                    (callbacks.on_force_global_color)(false);
-                }
-            });
-        }
-        appearance_group.add(&per_note_row);
-
-        let uniform_row = ActionRow::builder()
+        // Note color mode: a single switch (spec Mode A vs Mode B) — off keeps
+        // per-note colors, on forces one color for every note.
+        let uniform_row = SwitchRow::builder()
             .title("Uniform color")
-            .subtitle("All notes share one color")
-            .activatable_widget(&uniform_cb)
+            .subtitle("All notes share one color instead of each keeping its own")
+            .active(settings.force_global_color)
             .build();
-        pad_row(&uniform_row);
         {
             let callbacks = callbacks.clone();
-            uniform_cb.connect_toggled(move |cb| {
-                if cb.is_active() {
-                    (callbacks.on_force_global_color)(true);
-                }
+            uniform_row.connect_active_notify(move |row| {
+                (callbacks.on_force_global_color)(row.is_active());
             });
         }
         appearance_group.add(&uniform_row);
@@ -138,7 +109,6 @@ impl SettingsWindow {
             .build();
         // Render each entry as a color swatch + name.
         default_color_row.set_factory(Some(&color_factory()));
-        pad_row(&default_color_row);
         {
             let callbacks = callbacks.clone();
             default_color_row.connect_selected_notify(move |row| {
@@ -153,7 +123,6 @@ impl SettingsWindow {
             .subtitle("Match the desktop's light/dark preference")
             .active(settings.sync_dark_mode)
             .build();
-        pad_row(&dark_row);
         {
             let callbacks = callbacks.clone();
             dark_row.connect_active_notify(move |row| {
@@ -164,14 +133,12 @@ impl SettingsWindow {
         page.add(&appearance_group);
 
         let editing_group = PreferencesGroup::builder().title("Editing").build();
-        editing_group.set_margin_top(18);
         let save_row = ComboRow::builder()
             .title("Auto-save delay")
             .subtitle("Time after typing stops before a note is saved")
             .model(&gtk4::StringList::new(&SAVE_DELAY_LABELS))
             .selected(save_delay_index(settings.auto_save_debounce_ms))
             .build();
-        pad_row(&save_row);
         {
             let callbacks = callbacks.clone();
             save_row.connect_selected_notify(move |row| {
@@ -182,14 +149,12 @@ impl SettingsWindow {
         page.add(&editing_group);
 
         let integration_group = PreferencesGroup::builder().title("Integration").build();
-        integration_group.set_margin_top(18);
         let shortcut_row = SwitchRow::builder()
             .title("Global capture shortcut")
             .subtitle(shortcut_subtitle)
             .active(settings.enable_global_shortcut)
             .build();
         shortcut_row.set_sensitive(shortcut_support);
-        pad_row(&shortcut_row);
         {
             let callbacks = callbacks.clone();
             shortcut_row.connect_active_notify(move |row| {
@@ -203,7 +168,6 @@ impl SettingsWindow {
             .subtitle("Launch Pinlet when you sign in")
             .active(settings.autostart)
             .build();
-        pad_row(&autostart_row);
         {
             let callbacks = callbacks.clone();
             autostart_row.connect_active_notify(move |row| {
@@ -214,13 +178,11 @@ impl SettingsWindow {
         page.add(&integration_group);
 
         let storage_group = PreferencesGroup::builder().title("Storage").build();
-        storage_group.set_margin_top(18);
         let data_row = ActionRow::builder()
             .title("Data directory")
             .subtitle(data_dir.display().to_string())
             .activatable(true)
             .build();
-        pad_row(&data_row);
         data_row.connect_activated(move |_| {
             let uri = format!("file://{}", data_dir.display());
             let context = gtk4::gdk::Display::default().map(|display| display.app_launch_context());
@@ -232,7 +194,6 @@ impl SettingsWindow {
         page.add(&storage_group);
 
         let security_group = PreferencesGroup::builder().title("Security").build();
-        security_group.set_margin_top(18);
         let password_row = ActionRow::builder()
             .title("Master password")
             .subtitle("Used to lock and unlock notes")
@@ -243,7 +204,6 @@ impl SettingsWindow {
             .build();
         password_entry.set_text(master_password);
         password_row.add_suffix(&password_entry);
-        pad_row(&password_row);
         {
             let callbacks = callbacks.clone();
             password_entry.connect_changed(move |entry| {
@@ -254,28 +214,24 @@ impl SettingsWindow {
         page.add(&security_group);
 
         let git_group = PreferencesGroup::builder().title("Sync").build();
-        git_group.set_margin_top(18);
 
         let sync_row = SwitchRow::builder()
             .title("Sync with a remote")
             .subtitle("Push and pull the note repository")
             .active(settings.git_sync_enabled)
             .build();
-        pad_row(&sync_row);
         git_group.add(&sync_row);
 
         let remote_row = EntryRow::builder()
             .title("Remote URL")
             .text(settings.git_remote_url.as_str())
             .build();
-        pad_row(&remote_row);
         git_group.add(&remote_row);
 
         let branch_row = EntryRow::builder()
             .title("Branch")
             .text(settings.git_branch.as_str())
             .build();
-        pad_row(&branch_row);
         git_group.add(&branch_row);
 
         let pull_row = ActionRow::builder()
@@ -283,7 +239,6 @@ impl SettingsWindow {
             .subtitle("Fetch and fast-forward from the remote")
             .activatable(true)
             .build();
-        pad_row(&pull_row);
         git_group.add(&pull_row);
 
         let push_row = ActionRow::builder()
@@ -291,7 +246,6 @@ impl SettingsWindow {
             .subtitle("Push committed changes to the remote")
             .activatable(true)
             .build();
-        pad_row(&push_row);
         git_group.add(&push_row);
 
         let git_status = Label::builder().xalign(0.0).wrap(true).build();
@@ -383,14 +337,6 @@ fn save_delay_index(ms: u64) -> u32 {
     SAVE_DELAYS_MS.iter().position(|&value| value == ms).unwrap_or(0) as u32
 }
 
-/// Horizontal padding for preference rows.
-fn pad_row(row: &impl IsA<gtk4::Widget>) {
-    row.set_margin_start(8);
-    row.set_margin_end(8);
-    row.set_margin_top(2);
-    row.set_margin_bottom(2);
-}
-
 /// Factory that renders a combo entry as a color swatch plus its
 /// display name.
 fn color_factory() -> SignalListItemFactory {
@@ -424,7 +370,7 @@ fn color_factory() -> SignalListItemFactory {
             .map(|object| object.string().to_string())
             .unwrap_or_default();
         let color: NoteColor = name.parse().unwrap_or(NoteColor::Yellow);
-        swatch.set_css_classes(&[color.css_class()]);
+        swatch.set_css_classes(&[color.css_class(), "pinlet-swatch"]);
         label.set_label(color.name());
     });
     factory

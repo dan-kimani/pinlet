@@ -45,17 +45,28 @@
 headerbar.pinlet-header {
   background: transparent;
   box-shadow: none;
+  min-height: 0;
+  padding: 0 6px;
+  border-bottom: 1px solid alpha(currentColor, 0.2);
+}
+
+/* Compact, flat header buttons so the sticky note stays slim. */
+headerbar.pinlet-header button,
+headerbar.pinlet-header menubutton {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 4px;
+  margin: 0;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  color: inherit;
 }
 
 .pinlet-swatch {
   border-radius: 9999px;
   min-width: 16px;
   min-height: 16px;
-}
-
-/* Preferences: a small margin below each group title. */
-window.pinlet-settings preferencesgroup > box > box.header.single-line {
-  margin-bottom: 2px;
 }
 
 textview.pinlet-body,
@@ -92,10 +103,46 @@ window.pinlet-charcoal textview.pinlet-body {
   color: #ececec;
 }
 
-/* Embedded task-list checkboxes sit inline with the note text. */
-.pinlet-checkbox {
-  min-width: 16px;
-  min-height: 16px;
-  padding: 0;
-  margin: 0 4px 0 0;
+/* The header title and symbolic icons inherit the note's foreground, so they
+ * stay visible on every note color (notably the dark charcoal). */
+window.pinlet-yellow headerbar.pinlet-header {
+  color: #4a4523;
+}
+
+window.pinlet-green headerbar.pinlet-header {
+  color: #1f3d1c;
+}
+
+window.pinlet-blue headerbar.pinlet-header {
+  color: #173a54;
+}
+
+window.pinlet-pink headerbar.pinlet-header {
+  color: #54203a;
+}
+
+window.pinlet-purple headerbar.pinlet-header {
+  color: #2e2354;
+}
+
+window.pinlet-charcoal headerbar.pinlet-header {
+  color: #ececec;
+}
+
+/* Preferences: match GNOME Settings — elevate the cards so they clearly
+ * separate from the page, and crisp up the section titles. */
+preferencesgroup>box>box.header {
+  margin-bottom: 6px;
+  margin-top: 16px;
+}
+
+preferencesgroup>box>box.header>label {
+  color: @theme_fg_color;
+  font-size: 12pt;
+  font-weight: 700;
+}
+
+preferencesgroup list {
+  background-color: mix(@card_bg_color, white, 0.14);
+  border: none;
 }
