@@ -45,7 +45,7 @@ stored git-ignored in `locked/`, so they never sync.
 ## Install
 
 Pinlet is packaged for **Debian/Ubuntu**, **Fedora/RHEL/openSUSE**, and
-**Arch Linux (AUR)**, and is available as a **Flatpak**.
+**Arch Linux (AUR)**.
 
 ### Prebuilt packages (recommended)
 
@@ -60,10 +60,6 @@ binary.
 cargo build --release
 ./target/release/pinlet
 ```
-
-### Flatpak
-
-See [`flatpak/README.md`](flatpak/README.md).
 
 ### Debian package
 

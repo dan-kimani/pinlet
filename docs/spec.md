@@ -259,7 +259,7 @@ Machine-specific data that must never sync (illustrative):
 - [ ] Support interactive checklists and drag-and-drop text attachments.
 - [ ] Quick capture: CLI subcommand + global shortcut via GlobalShortcuts portal. _(§3.9)_
 - [ ] Encrypted locked notes (argon2id + XChaCha20-Poly1305, local-only). _(§3.10)_
-- [ ] Package app as Flatpak and Debian .deb package for easy installation on Ubuntu.
+- [ ] Package app as Debian .deb package for easy installation on Ubuntu.
 
 ### Phase 4: Post-v1 Enhancements (Weeks 7–8)
 
