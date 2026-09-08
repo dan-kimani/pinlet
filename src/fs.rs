@@ -5,6 +5,7 @@
 //! additionally get owner-only permissions.
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -12,10 +13,7 @@ use crate::error::AppResult;
 
 /// Atomically write `contents` to `path` (temp file + rename).
 pub fn atomic_write(path: &Path, contents: &[u8]) -> AppResult<()> {
-    let tmp = tmp_path(path);
-    fs::write(&tmp, contents)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+    durable_write(path, contents, false)
 }
 
 /// Atomically write `contents` to `path`, restricting the file to
@@ -25,10 +23,26 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> AppResult<()> {
 /// destination is never briefly world-readable — and an existing file
 /// with lax permissions heals itself on the next save.
 pub fn atomic_write_private(path: &Path, contents: &[u8]) -> AppResult<()> {
+    durable_write(path, contents, true)
+}
+
+/// Temp file + fsync + rename + directory fsync. The rename alone
+/// only guarantees atomicity, not durability: without syncing the
+/// file's data and the parent directory, a crash can lose a save
+/// that was already reported as done.
+fn durable_write(path: &Path, contents: &[u8], private: bool) -> AppResult<()> {
     let tmp = tmp_path(path);
-    fs::write(&tmp, contents)?;
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    {
+        let mut file = fs::File::create(&tmp)?;
+        if private {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(contents)?;
+        file.sync_all()?;
+    }
     fs::rename(&tmp, path)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 

@@ -25,26 +25,48 @@ pub struct LocalState {
 /// Window position and size. GTK4 cannot position normal windows on
 /// Wayland, so `x`/`y` are X11-only there — for pinned notes they are
 /// the layer-shell margins. Width and height always restore.
+///
+/// Fields default individually so one partial entry parses instead
+/// of failing the whole file; callers ignore non-positive sizes.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct WindowGeometry {
     /// Screen X coordinate (X11 only).
+    #[serde(default)]
     pub x: i32,
     /// Screen Y coordinate (X11 only).
+    #[serde(default)]
     pub y: i32,
     /// Window width.
+    #[serde(default)]
     pub width: i32,
     /// Window height.
+    #[serde(default)]
     pub height: i32,
 }
 
 impl LocalState {
-    /// Load from `path`; a missing file yields an empty state.
+    /// Load from `path`; a missing file yields an empty state, and a
+    /// corrupt one falls back to empty rather than failing startup —
+    /// geometry is reconstructible, and a single bad byte must never
+    /// brick the app.
     pub fn load(path: &Path) -> AppResult<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let raw = fs::read_to_string(path)?;
-        serde_json::from_str(&raw).map_err(|err| AppError::Settings(err.to_string()))
+        let raw = match fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(err) => {
+                eprintln!("unreadable local state, starting fresh: {err}");
+                return Ok(Self::default());
+            }
+        };
+        match serde_json::from_str(&raw) {
+            Ok(state) => Ok(state),
+            Err(err) => {
+                eprintln!("corrupt local state, starting fresh: {err}");
+                Ok(Self::default())
+            }
+        }
     }
 
     /// Atomically persist to `path` with owner-only permissions (the
@@ -93,5 +115,29 @@ mod tests {
             std::env::temp_dir().join(format!("pinlet-missing-{}.json", uuid::Uuid::new_v4()));
         let state = LocalState::load(&path).unwrap();
         assert!(state.window_geometry.is_empty());
+    }
+
+    #[test]
+    fn corrupt_file_falls_back_to_empty() {
+        let path =
+            std::env::temp_dir().join(format!("pinlet-corrupt-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&path, "{ not json").unwrap();
+        let state = LocalState::load(&path).unwrap();
+        assert!(state.window_geometry.is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn partial_geometry_entry_parses_with_zero_defaults() {
+        let path =
+            std::env::temp_dir().join(format!("pinlet-partial-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&path, r#"{"window_geometry": {"abc": {"width": 300}}}"#).unwrap();
+        let state = LocalState::load(&path).unwrap();
+        let geometry = state.window_geometry.get("abc").copied().unwrap();
+        assert_eq!(geometry.width, 300);
+        assert_eq!(geometry.height, 0);
+        assert_eq!(geometry.x, 0);
+        assert_eq!(geometry.y, 0);
+        std::fs::remove_file(path).unwrap();
     }
 }

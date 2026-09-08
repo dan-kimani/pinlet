@@ -665,6 +665,13 @@ impl App {
             on_close: Box::new({
                 let this = self.clone();
                 move || {
+                    // Managed close (trash, reopen): the caller already
+                    // saved, scheduled the commit, and dropped the
+                    // registry entry — running the path again would
+                    // clobber its commit message and commit early.
+                    if this.inner.closing_managed.borrow_mut().remove(&id) {
+                        return;
+                    }
                     this.save_now(id);
                     this.save_geometry();
                     // The window is being destroyed: drop the registry
@@ -808,11 +815,20 @@ impl App {
         // The in-memory body becomes the blob: unlocking decrypts it,
         // and later saves rewrite the same ciphertext (never plaintext).
         *shared.body.borrow_mut() = blob;
-        // The plaintext copy in notes/ must go.
+        // The plaintext copy in notes/ must go. A failure here is
+        // security-relevant: the note is locked, but readable
+        // plaintext remains on disk — so fail loud instead of
+        // logging and reporting success.
         let plain_path = self.inner.store.path_for(id);
         if plain_path.exists()
-            && let Err(err) = std::fs::remove_file(plain_path)
+            && let Err(err) = std::fs::remove_file(&plain_path)
         {
+            if let Some(window) = self.inner.windows.borrow().get(&id) {
+                window.show_error(&format!(
+                    "Note locked, but the plaintext copy could not be removed ({}). Delete it manually to complete the lock.",
+                    plain_path.display()
+                ));
+            }
             eprintln!("failed to remove plaintext note {id}: {err}");
         }
         *self.inner.commit_message.borrow_mut() = format!("Lock note '{title}'");
@@ -882,7 +898,11 @@ impl App {
         // handler runs synchronously and borrows the registries.
         let window = self.inner.windows.borrow_mut().remove(&id);
         if let Some(window) = window {
+            // Managed close: the callers (lock/unlock/pin) already
+            // saved and scheduled their own commit message.
+            self.inner.closing_managed.borrow_mut().insert(id);
             window.close();
+            self.inner.closing_managed.borrow_mut().remove(&id);
         }
         self.open_window(id);
     }
@@ -1078,8 +1098,11 @@ impl App {
         self.refresh_tray_snapshot();
         // Close last: the close-request handler runs synchronously
         // and touches the registries — no borrow may be held here.
+        // Managed close: keep the scheduled Delete commit debounced.
         if let Some(window) = window {
+            self.inner.closing_managed.borrow_mut().insert(id);
             window.close();
+            self.inner.closing_managed.borrow_mut().remove(&id);
         }
     }
 
@@ -1193,16 +1216,9 @@ impl App {
                     // upcoming occurrence rather than a due time that no
                     // longer exists. Missed occurrences collapse into this
                     // single firing rather than backlogging.
-                    if reminder.recurrence_rule != Recurrence::None {
-                        let mut due = reminder.due_at;
-                        for _ in 0..366 {
-                            due = reminder.recurrence_rule.next_after(due);
-                            if due > now {
-                                break;
-                            }
-                        }
-                        reminder.due_at = due;
-                    }
+                    reminder.due_at = reminder
+                        .recurrence_rule
+                        .next_occurrence(reminder.due_at, now);
                     reminder.last_fired_at = Some(now);
                     fired.push((*id, reminder.due_at, title.clone()));
                     dirty = true;
@@ -1773,6 +1789,7 @@ mod tests {
 
         note_body_text_gets_its_color();
         delete_note_scenario();
+        trash_keeps_its_commit_message();
         picking_two_colors_scenario();
         pinning_scenario();
         markdown_source_roundtrip();
@@ -1942,6 +1959,42 @@ mod tests {
         app.delete_note(id);
         assert!(app.inner.notes.borrow().is_empty());
         assert!(!app.inner.store.path_for(id).exists());
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// Trashing a note closes its window, which must not re-enter the
+    /// close path: the Trash commit message has to survive (and stay
+    /// debounced instead of committing immediately).
+    fn trash_keeps_its_commit_message() {
+        let scratch = std::env::temp_dir().join(format!("pinlet-trash-test-{}", Uuid::new_v4()));
+
+        let gtk_app = gtk4::Application::builder()
+            .application_id("org.pinlet.TestTrash")
+            .build();
+        let app = App::new_in(&gtk_app, scratch.join("pinlet")).expect("app initializes");
+        let id = app.new_note(NoteColor::Yellow, "trash me".to_owned());
+        pump_main_loop();
+
+        app.trash_note(id);
+        pump_main_loop();
+        assert!(
+            app.inner
+                .notes
+                .borrow()
+                .get(&id)
+                .is_some_and(|shared| shared.note.borrow().is_trashed),
+            "note should be flagged trashed"
+        );
+        assert!(
+            !app.inner.windows.borrow().contains_key(&id),
+            "window should be gone"
+        );
+        assert_eq!(
+            app.inner.commit_message.borrow().as_str(),
+            "Trash note 'trash me'",
+            "the managed close must not clobber the commit message"
+        );
 
         let _ = std::fs::remove_dir_all(&scratch);
     }

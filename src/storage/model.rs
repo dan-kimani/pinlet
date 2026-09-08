@@ -116,10 +116,10 @@ impl Serialize for NoteColor {
 impl<'de> Deserialize<'de> for NoteColor {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(deserializer)?;
-        match raw.parse() {
-            Ok(color) => Ok(color),
-            Err(never) => match never {},
-        }
+        // Lenient like every other frontmatter field: an unknown
+        // color falls back to the default instead of producing a
+        // `Custom` that matches no stylesheet rule.
+        Ok(Self::parse_validated(&raw).unwrap_or_default())
     }
 }
 
@@ -169,18 +169,23 @@ impl Serialize for Recurrence {
 impl<'de> Deserialize<'de> for Recurrence {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(deserializer)?;
-        match raw.as_str() {
-            "none" => Ok(Self::None),
-            "daily" => Ok(Self::Daily),
-            "weekly" => Ok(Self::Weekly),
-            "weekdays" => Ok(Self::Weekdays),
+        let parsed = match raw.as_str() {
+            "none" => Self::None,
+            "daily" => Self::Daily,
+            "weekly" => Self::Weekly,
+            "weekdays" => Self::Weekdays,
             other => other
                 .strip_prefix("custom:")
                 .and_then(|rest| rest.strip_suffix('d'))
                 .and_then(|days| days.parse().ok())
                 .map(Self::Custom)
-                .ok_or_else(|| D::Error::custom(format!("invalid recurrence rule: {other}"))),
-        }
+                // Lenient: one hand-edited garbage rule must not fail
+                // the whole note parse and drop the note from the
+                // store. It degrades to a one-shot reminder and is
+                // normalized on the next save.
+                .unwrap_or(Self::None),
+        };
+        Ok(parsed)
     }
 }
 
@@ -198,6 +203,41 @@ impl Recurrence {
             Self::Custom(n) => due + Duration::days(i64::from((*n).max(1))),
         }
     }
+
+    /// The first occurrence strictly after `now`, starting from `due`.
+    /// Missed occurrences collapse into this single firing. Unlike an
+    /// iteratively capped advance, this always lands in the future —
+    /// a long-overdue reminder can never get stuck with a past due
+    /// that neither fires nor appears upcoming.
+    pub fn next_occurrence(&self, due: DateTime<Utc>, now: DateTime<Utc>) -> DateTime<Utc> {
+        match self {
+            Self::None => due,
+            Self::Daily => shift_past(due, now, 1),
+            Self::Weekly => shift_past(due, now, 7),
+            Self::Custom(n) => shift_past(due, now, i64::from((*n).max(1))),
+            Self::Weekdays => {
+                // Every step moves at least a day forward, so this
+                // always terminates.
+                let mut next = due;
+                while next <= now {
+                    next = next_weekday(next);
+                }
+                next
+            }
+        }
+    }
+}
+
+/// `due` advanced by whole `step`-day blocks to land strictly past
+/// `now`, preserving the time of day.
+fn shift_past(due: DateTime<Utc>, now: DateTime<Utc>, step: i64) -> DateTime<Utc> {
+    if due > now {
+        return due;
+    }
+    // Whole step-blocks past the present. Both operands are >= 1
+    // here (`due <= now`, `step >= 1` at every call site).
+    let behind = (now - due).num_days() + 1;
+    due + Duration::days((behind + step - 1) / step * step)
 }
 
 /// The next weekday (Mon–Fri) strictly after `due`.
@@ -401,7 +441,10 @@ mod tests {
         let none: Recurrence = serde_yaml_ng::from_str("none").unwrap();
         assert_eq!(none, Recurrence::None);
 
-        assert!(serde_yaml_ng::from_str::<Recurrence>("garbage").is_err());
+        // Lenient: garbage degrades to a one-shot rule instead of
+        // failing the note parse.
+        let garbage: Recurrence = serde_yaml_ng::from_str("garbage").unwrap();
+        assert_eq!(garbage, Recurrence::None);
     }
 
     #[test]
@@ -443,6 +486,44 @@ mod tests {
     }
 
     #[test]
+    fn next_occurrence_always_lands_future() {
+        let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let fri = at("2024-01-05T10:00:00Z");
+        // Already future: untouched.
+        assert_eq!(
+            Recurrence::Daily.next_occurrence(at("2024-01-06T10:00:00Z"), fri),
+            at("2024-01-06T10:00:00Z")
+        );
+        // Just overdue: the next slot, time of day kept.
+        assert_eq!(
+            Recurrence::Daily.next_occurrence(fri, at("2024-01-05T10:00:01Z")),
+            at("2024-01-06T10:00:00Z")
+        );
+        // Years overdue: still lands future instead of sticking past.
+        let long_overdue = Recurrence::Daily.next_occurrence(fri, at("2027-06-01T09:00:00Z"));
+        assert!(long_overdue > at("2027-06-01T09:00:00Z"));
+        assert_eq!(long_overdue.time(), fri.time(), "time of day is preserved");
+        // Weekly and custom advance by whole blocks.
+        assert_eq!(
+            Recurrence::Weekly.next_occurrence(fri, at("2024-01-10T10:00:00Z")),
+            at("2024-01-12T10:00:00Z")
+        );
+        assert_eq!(
+            Recurrence::Custom(3).next_occurrence(fri, at("2024-01-10T10:00:00Z")),
+            at("2024-01-11T10:00:00Z")
+        );
+        // Weekdays skip the weekend even from far past.
+        let next = Recurrence::Weekdays.next_occurrence(fri, at("2024-01-20T10:00:00Z"));
+        assert!(next > at("2024-01-20T10:00:00Z"));
+        assert!(!matches!(next.weekday(), Weekday::Sat | Weekday::Sun));
+        // One-shots never move.
+        assert_eq!(
+            Recurrence::None.next_occurrence(fri, at("2025-01-01T00:00:00Z")),
+            fri
+        );
+    }
+
+    #[test]
     fn color_wire_format() {
         let yaml = serde_yaml_ng::to_string(&NoteColor::Yellow).unwrap();
         assert_eq!(yaml.trim(), "Yellow");
@@ -450,8 +531,10 @@ mod tests {
         let custom: NoteColor = serde_yaml_ng::from_str("\"#ff00aa\"").unwrap();
         assert_eq!(custom, NoteColor::Custom("#ff00aa".to_owned()));
 
+        // Unknown strings fall back to the default instead of a
+        // `Custom` that matches no stylesheet rule.
         let unknown: NoteColor = serde_yaml_ng::from_str("\"anything\"").unwrap();
-        assert_eq!(unknown, NoteColor::Custom("anything".to_owned()));
+        assert_eq!(unknown, NoteColor::default());
     }
 
     #[test]

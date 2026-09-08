@@ -184,7 +184,7 @@ The note directory under the XDG data dir is a git repository the user fully own
 
 ### 4.2 Note File Format
 
-Each note file carries its metadata in YAML frontmatter; the body is the note's Markdown content. A note may carry any number of independent reminders in its `reminders` list. Writes are atomic (temp file, then rename).
+Each note file carries its metadata in YAML frontmatter; the body is the note's Markdown content. A note may carry any number of independent reminders in its `reminders` list. Writes are atomic (temp file, fsync, rename, directory fsync). Parsing is lenient: unknown `color` values fall back to the default and unknown `recurrence_rule` values to `none`, so one hand-edited value never drops a note.
 
 ```yaml
 ---

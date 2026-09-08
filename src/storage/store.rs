@@ -49,12 +49,27 @@ impl NoteStore {
 
     /// Load every readable note paired with its body text — plain
     /// notes and locked notes (whose body is an encrypted blob).
-    /// Malformed files are skipped with a warning, never fatal.
+    /// Malformed files are skipped with a warning, never fatal, and
+    /// neither is an unreadable directory: one bad dir must not hide
+    /// the notes in the other.
     pub fn load_all(&self) -> AppResult<Vec<(Note, String)>> {
         let mut notes = Vec::new();
         for dir in [self.notes_dir(), self.locked_dir()] {
-            for entry in fs::read_dir(&dir)? {
-                let path = entry?.path();
+            let entries = match fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(err) => {
+                    eprintln!("skipping unreadable notes dir {}: {err}", dir.display());
+                    continue;
+                }
+            };
+            for entry in entries {
+                let path = match entry {
+                    Ok(entry) => entry.path(),
+                    Err(err) => {
+                        eprintln!("skipping unreadable dir entry: {err}");
+                        continue;
+                    }
+                };
                 if !is_note_file(&path) {
                     continue;
                 }

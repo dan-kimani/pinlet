@@ -72,8 +72,20 @@ impl Settings {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let raw = fs::read_to_string(path)?;
-        serde_json::from_str(&raw).map_err(|err| AppError::Settings(err.to_string()))
+        let raw = match fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(err) => {
+                eprintln!("unreadable settings, starting with defaults: {err}");
+                return Ok(Self::default());
+            }
+        };
+        match serde_json::from_str(&raw) {
+            Ok(settings) => Ok(settings),
+            Err(err) => {
+                eprintln!("corrupt settings, starting with defaults: {err}");
+                Ok(Self::default())
+            }
+        }
     }
 
     /// Atomically persist to `path`.
@@ -81,5 +93,26 @@ impl Settings {
         let raw = serde_json::to_string_pretty(self)
             .map_err(|err| AppError::Settings(err.to_string()))?;
         crate::fs::atomic_write(path, raw.as_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corrupt_file_falls_back_to_defaults() {
+        let path = std::env::temp_dir().join("pinlet-settings-corrupt-test.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let settings = Settings::load(&path).unwrap();
+        assert_eq!(settings, Settings::default());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn missing_file_loads_defaults() {
+        let path = std::env::temp_dir().join("pinlet-settings-absent-test.json");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(Settings::load(&path).unwrap(), Settings::default());
     }
 }
