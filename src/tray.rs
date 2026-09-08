@@ -131,8 +131,21 @@ pub struct TraySnapshot {
     pub upcoming: Vec<DueReminder>,
     /// All notes, sorted by title, so a closed one can be reopened.
     pub notes: Vec<TrayNote>,
+    /// Trashed notes, sorted by title, awaiting restore or emptying.
+    pub trash: Vec<TrayNote>,
     /// Git sync status for the sync menu item.
     pub sync: SyncState,
+}
+
+/// Sort note entries by title (case-insensitive), id as tiebreak —
+/// shared by the notes and trash sections.
+pub fn sort_by_title(list: &mut [TrayNote]) {
+    list.sort_by(|a, b| {
+        a.title
+            .to_lowercase()
+            .cmp(&b.title.to_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
 }
 
 /// The ksni tray handle type.
@@ -174,20 +187,35 @@ impl PinletTray {
         })
     }
 
-    /// One page of the Notes submenu: up to five notes, plus a nested
-    /// "More…" page while notes remain.
-    fn notes_page(notes: &[TrayNote], tx: &MsgSender<Msg>) -> Vec<MenuItem<Self>> {
+    /// One page of a note list: up to five entries, plus a nested
+    /// "More…" page while notes remain. `restore` picks the click
+    /// behavior — reopen for notes, restore for trash.
+    fn notes_page(notes: &[TrayNote], restore: bool, tx: &MsgSender<Msg>) -> Vec<MenuItem<Self>> {
         const PAGE: usize = 5;
         let mut items: Vec<MenuItem<Self>> = notes
             .iter()
             .take(PAGE)
             .map(|note| {
-                Self::item(
-                    &note.title,
-                    "document-open-symbolic",
-                    Msg::FocusNote(note.id),
-                    tx,
-                )
+                if restore {
+                    let open = Msg::RestoreNote(note.id);
+                    let delete = Msg::DeleteForever(note.id);
+                    MenuItem::SubMenu(SubMenu {
+                        label: note.title.clone(),
+                        icon_name: "document-open-symbolic".to_owned(),
+                        submenu: vec![
+                            Self::item("Restore", "document-revert-symbolic", open, tx),
+                            Self::item("Delete forever", "user-trash-full-symbolic", delete, tx),
+                        ],
+                        ..Default::default()
+                    })
+                } else {
+                    Self::item(
+                        &note.title,
+                        "document-open-symbolic",
+                        Msg::FocusNote(note.id),
+                        tx,
+                    )
+                }
             })
             .collect();
         if notes.len() > PAGE {
@@ -195,7 +223,7 @@ impl PinletTray {
             items.push(MenuItem::SubMenu(SubMenu {
                 label: format!("More… ({} remaining)", rest.len()),
                 icon_name: "view-more-symbolic".to_owned(),
-                submenu: Self::notes_page(rest, tx),
+                submenu: Self::notes_page(rest, restore, tx),
                 ..Default::default()
             }));
         }
@@ -313,7 +341,28 @@ impl Tray for PinletTray {
             items.push(MenuItem::SubMenu(SubMenu {
                 label: "Notes".to_owned(),
                 icon_name: "document-open-symbolic".to_owned(),
-                submenu: Self::notes_page(&snapshot.notes, &self.tx),
+                submenu: Self::notes_page(&snapshot.notes, false, &self.tx),
+                ..Default::default()
+            }));
+        }
+
+        // Trashed notes wait here for restore or permanent deletion.
+        // Each entry offers both, paged like the notes list; "Empty
+        // trash" deletes everything at once. Deletion is immediate —
+        // the trash itself was the confirmation step — and the git
+        // history still holds the content.
+        if !snapshot.trash.is_empty() {
+            let mut submenu = vec![Self::item(
+                "Empty trash",
+                "user-trash-full-symbolic",
+                Msg::EmptyTrash,
+                &self.tx,
+            )];
+            submenu.extend(Self::notes_page(&snapshot.trash, true, &self.tx));
+            items.push(MenuItem::SubMenu(SubMenu {
+                label: format!("Trash ({})", snapshot.trash.len()),
+                icon_name: "user-trash-symbolic".to_owned(),
+                submenu,
                 ..Default::default()
             }));
         }

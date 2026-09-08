@@ -1,13 +1,15 @@
 //! The GTK4 / libadwaita layer: note windows, colors, styling.
 
-mod colors;
+pub mod colors;
 mod note_window;
 pub mod password_dialog;
 mod reminder_dialog;
 mod settings_window;
 pub mod x11;
 
-pub use note_window::{NoteCallbacks, NoteWindow};
+#[cfg(test)]
+pub(crate) use note_window::wire_list_continuation;
+pub use note_window::{NoteCallbacks, NoteWindow, clamp_font_scale};
 pub use settings_window::{SettingsCallbacks, SettingsWindow};
 
 use std::cell::RefCell;

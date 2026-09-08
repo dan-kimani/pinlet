@@ -1,7 +1,9 @@
 //! The sticky note window: header actions and Markdown body.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -21,7 +23,7 @@ use gtk4::{
 use crate::app::SharedNote;
 use crate::markdown::{MarkdownStyler, source_to_preview};
 use crate::pinning::PinBackend;
-use crate::storage::{NoteColor, Recurrence, Reminder, WindowGeometry};
+use crate::storage::{Note, NoteColor, Recurrence, Reminder, WindowGeometry};
 use crate::ui::colors;
 use crate::ui::reminder_dialog;
 
@@ -70,6 +72,10 @@ pub struct NoteCallbacks {
     pub on_toggle_pin: Box<dyn Fn()>,
     /// The user asked to lock or unlock the note.
     pub on_lock_requested: Box<dyn Fn()>,
+    /// The user added or removed tags.
+    pub on_tags_changed: Box<dyn Fn(Vec<String>)>,
+    /// The user changed the per-note text scale (`None` = global).
+    pub on_font_scale: Box<dyn Fn(Option<f32>)>,
 }
 
 /// One window per note, styled like a sheet of paper.
@@ -89,16 +95,42 @@ pub struct NoteWindow {
     /// applied. Shared with the palette swatches (via `Rc`) so leaving
     /// a custom color also removes its display-wide rules.
     custom_css: Rc<RefCell<Option<gtk4::CssProvider>>>,
+    /// Per-window text-scale class and provider, swapped by
+    /// [`NoteWindow::apply_font_scale`]. The class is unique per
+    /// window so one note's scale never restyles another's.
+    font_class: String,
+    font_css: Rc<RefCell<Option<gtk4::CssProvider>>>,
+    /// Global scale the per-note override falls back to. Updated
+    /// live when Preferences changes it.
+    font_base: Rc<Cell<f32>>,
+    /// The reset button doubles as the scale indicator ("110%").
+    font_reset: Button,
+    /// Tag pill colors, shadowing the settings map — updated live
+    /// through [`NoteWindow::set_tag_colors`].
+    tag_colors: Rc<RefCell<HashMap<String, String>>>,
+    /// Footer pills, rebuilt when tags or their colors change.
+    tagbar: gtk4::Box,
+    /// Plus button and inline entry for new tags; hidden at the cap.
+    tag_add: Button,
+    tag_entry: gtk4::Entry,
+    /// The note's live model (tags and per-note scale are read here).
+    shared: Rc<SharedNote>,
+    /// App-core callbacks, reused when pills rebuild themselves.
+    callbacks: Rc<NoteCallbacks>,
 }
 
 impl NoteWindow {
     /// Build a note window and wire it to the app-core callbacks.
+    /// `tag_colors` seeds the pill colors from settings; `font_base`
+    /// is the global text scale the note falls back to.
     pub fn new(
         app: &gtk4::Application,
         shared: Rc<SharedNote>,
         geometry: Option<WindowGeometry>,
         callbacks: NoteCallbacks,
         pin_backend: PinBackend,
+        tag_colors: HashMap<String, String>,
+        font_base: f32,
     ) -> Self {
         let callbacks = Rc::new(callbacks);
         let color = shared.note.borrow().color.clone();
@@ -250,25 +282,26 @@ impl NoteWindow {
             .tooltip_text("Reminders")
             .build();
 
-        // Delete, with confirmation.
+        // Trash, with confirmation. The note leaves the window and
+        // every list, but stays restorable from the tray Trash menu.
         let delete_btn = Button::from_icon_name("user-trash-symbolic");
-        delete_btn.set_tooltip_text(Some("Delete note"));
+        delete_btn.set_tooltip_text(Some("Move to trash"));
         {
             let window = window.clone();
             let callbacks = callbacks.clone();
             delete_btn.connect_clicked(move |_| {
                 let dialog = adw::MessageDialog::builder()
-                    .heading("Delete note?")
-                    .body("The note file will be removed; its history remains in git.")
+                    .heading("Move note to trash?")
+                    .body("Restore it from the tray Trash menu, or empty the trash to delete it forever. Its history remains in git either way.")
                     .build();
                 dialog.add_response("cancel", "Cancel");
-                dialog.add_response("delete", "Delete");
-                dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+                dialog.add_response("trash", "Move to trash");
+                dialog.set_response_appearance("trash", adw::ResponseAppearance::Destructive);
                 dialog.set_default_response(Some("cancel"));
                 dialog.set_transient_for(Some(&window));
                 let callbacks = callbacks.clone();
                 dialog.connect_response(None, move |dialog, response| {
-                    if response == "delete" {
+                    if response == "trash" {
                         (callbacks.on_delete)();
                     }
                     dialog.close();
@@ -477,10 +510,14 @@ impl NoteWindow {
         // item in the editable source (preview line N is source line N:
         // the checkbox transform never adds or removes newlines). The
         // edit goes through the normal change → debounced-save path.
+        // Capture phase: the press must be claimed before the TextView's
+        // own handlers place the cursor — otherwise the wholesale buffer
+        // replacement below strands a selection from the note's start.
         let checkbox_click = gtk4::GestureClick::new();
         // Left button only: middle/right presses keep their default
         // behavior (paste, context menu).
         checkbox_click.set_button(gdk::BUTTON_PRIMARY);
+        checkbox_click.set_propagation_phase(gtk4::PropagationPhase::Capture);
         {
             let edit_view = edit_view.clone();
             let preview_view = preview_view.clone();
@@ -500,6 +537,9 @@ impl NoteWindow {
                 if toggle_checkbox_at(&edit_view, &preview_view, &iter) {
                     gesture.set_state(gtk4::EventSequenceState::Claimed);
                     refresh_preview(&edit_view, &preview_view, &styler);
+                    // Collapse any selection the press left behind.
+                    let buffer = preview_view.buffer();
+                    buffer.place_cursor(&buffer.start_iter());
                 }
             });
         }
@@ -527,6 +567,111 @@ impl NoteWindow {
             });
         }
 
+        // Per-window text-scale class: unique per window (a static
+        // counter) so one note's scale never restyles another's.
+        static FONT_CLASS_NEXT: AtomicU32 = AtomicU32::new(1);
+        let font_class = format!(
+            "pinlet-font-{}",
+            FONT_CLASS_NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        window.add_css_class(&font_class);
+        let font_css = Rc::new(RefCell::new(None));
+        let font_base = Rc::new(Cell::new(clamp_font_scale(font_base)));
+
+        // Tag pills plus an inline entry, living in the footer and
+        // rebuilt when tags or their colors change. Locked notes show
+        // a placeholder, never metadata — no tags.
+        let tag_colors = Rc::new(RefCell::new(tag_colors));
+        let tagbar = gtk4::Box::new(Orientation::Horizontal, 4);
+        tagbar.add_css_class("pinlet-tagbar");
+        tagbar.set_hexpand(true);
+        let tag_entry = gtk4::Entry::builder()
+            .placeholder_text("Add tag…")
+            .tooltip_text("Add a tag (Enter)")
+            .max_length(Note::MAX_TAG_LEN as i32)
+            .width_chars(12)
+            .visible(false)
+            .build();
+        let tag_add = Button::from_icon_name("list-add-symbolic");
+        tag_add.add_css_class("pinlet-tag-add");
+        tag_add.set_tooltip_text(Some("Add tag"));
+        if !locked {
+            rebuild_tagbar(
+                &tagbar,
+                &tag_add,
+                &tag_entry,
+                &shared,
+                &tag_colors,
+                &callbacks,
+            );
+            {
+                let entry = tag_entry.clone();
+                tag_add.connect_clicked(move |_| {
+                    use gtk4::prelude::WidgetExt;
+                    let show = !WidgetExt::is_visible(&entry);
+                    entry.set_visible(show);
+                    if show {
+                        entry.grab_focus();
+                    }
+                });
+            }
+            let entry = tag_entry.clone();
+            let bar = tagbar.clone();
+            let add = tag_add.clone();
+            let shared = shared.clone();
+            let colors = tag_colors.clone();
+            let callbacks = callbacks.clone();
+            tag_entry.connect_activate(move |_| {
+                // A leading hash is decoration, not part of the name.
+                let raw = entry.text().to_string();
+                let raw = raw.trim_start_matches('#');
+                let Some(tag) = Note::normalize_tag(raw) else {
+                    return;
+                };
+                let mut tags = shared.note.borrow().tags.clone();
+                if !tags.iter().any(|existing| existing == &tag) {
+                    tags.push(tag);
+                    (callbacks.on_tags_changed)(tags);
+                    rebuild_tagbar(&bar, &add, &entry, &shared, &colors, &callbacks);
+                }
+                entry.set_text("");
+            });
+        }
+
+        // Markdown toolbar (edit mode only) with text-size controls.
+        let toolbar = gtk4::Box::new(Orientation::Horizontal, 2);
+        toolbar.add_css_class("pinlet-toolbar");
+        let font_reset = Button::builder()
+            .tooltip_text("Reset to the global text size (Ctrl+0)")
+            .build();
+        if !locked {
+            build_toolbar(
+                &toolbar,
+                &edit_view,
+                &shared,
+                &font_base,
+                &font_reset,
+                &callbacks,
+            );
+        }
+
+        // Footer under the editor: tag pills plus the inline entry
+        // on the left, word/character counts on the right.
+        let footer = gtk4::Box::new(Orientation::Horizontal, 0);
+        footer.add_css_class("pinlet-footer");
+        footer.append(&tag_add);
+        footer.append(&tag_entry);
+        footer.append(&tagbar);
+        let count_label = Label::builder().xalign(1.0).build();
+        footer.append(&count_label);
+        if !locked {
+            let buffer = edit_view.buffer();
+            update_counts(&buffer, &count_label);
+            buffer.connect_changed(move |buffer| {
+                update_counts(buffer, &count_label);
+            });
+        }
+
         // Toggle between the raw editor and the rendered preview.
         let stack = Stack::new();
         stack.add_named(&edit_view, Some("edit"));
@@ -534,21 +679,25 @@ impl NoteWindow {
         stack.set_visible_child(&edit_view);
 
         // Wire the eye toggle to the edit/preview views now that they exist.
+        // The toolbar only makes sense while editing.
         {
             let edit_view = edit_view.clone();
             let preview_view = preview_view.clone();
             let stack = stack.clone();
             let styler = styler.clone();
+            let toolbar = toolbar.clone();
             preview_toggle.connect_toggled(move |button| {
                 if button.is_active() {
                     button.set_icon_name("view-reveal-symbolic");
                     button.set_tooltip_text(Some("Edit"));
                     refresh_preview(&edit_view, &preview_view, &styler);
                     stack.set_visible_child(&preview_view);
+                    toolbar.set_visible(false);
                 } else {
                     button.set_icon_name("view-conceal-symbolic");
                     button.set_tooltip_text(Some("Preview"));
                     stack.set_visible_child(&edit_view);
+                    toolbar.set_visible(true);
                 }
             });
         }
@@ -576,6 +725,35 @@ impl NoteWindow {
                 });
             }
             edit_view.add_controller(drop_target);
+
+            // Clicking a task marker in the editor flips it in place
+            // (one undo step), mirroring the preview checkboxes.
+            // Capture phase, like the preview gesture: claim the press
+            // before the TextView places the cursor or starts a drag.
+            let edit_checkbox = gtk4::GestureClick::new();
+            edit_checkbox.set_button(gdk::BUTTON_PRIMARY);
+            edit_checkbox.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            {
+                let view = edit_view.clone();
+                let buffer = edit_view.buffer();
+                edit_checkbox.connect_pressed(move |gesture, n_press, x, y| {
+                    if n_press != 1 {
+                        return;
+                    }
+                    let Some((bx, by)) = buffer_coords(&view, x, y) else {
+                        return;
+                    };
+                    let Some(iter) = view.iter_at_location(bx, by) else {
+                        return;
+                    };
+                    if toggle_editor_checkbox(&buffer, iter.line(), iter.line_offset()) {
+                        gesture.set_state(gtk4::EventSequenceState::Claimed);
+                    }
+                });
+            }
+            edit_view.add_controller(edit_checkbox);
+
+            wire_list_continuation(&edit_view.buffer());
         }
 
         let scroller = ScrolledWindow::builder()
@@ -585,7 +763,13 @@ impl NoteWindow {
             .build();
 
         let content = gtk4::Box::new(Orientation::Vertical, 0);
+        if !locked {
+            content.append(&toolbar);
+        }
         content.append(&scroller);
+        if !locked {
+            content.append(&footer);
+        }
 
         window.set_titlebar(Some(&header));
         window.set_child(Some(&content));
@@ -612,6 +796,9 @@ impl NoteWindow {
         // Esc closes the note through the same path as the window
         // controls (save, geometry, deregister). Open popovers consume
         // Escape themselves first, so this only fires when none is up.
+        // Ctrl+plus/minus/0 adjust the per-note text size the same way
+        // the toolbar buttons do (locked notes have no toolbar, so no
+        // shortcuts either).
         {
             let window = window.clone();
             let esc = gtk4::ShortcutController::new();
@@ -626,6 +813,32 @@ impl NoteWindow {
                     })),
                 ));
             }
+            if !locked {
+                for (keys, step) in [("<Control>plus", 0.1f32), ("<Control>minus", -0.1f32)] {
+                    if let Some(trigger) = gtk4::ShortcutTrigger::parse_string(keys) {
+                        let shared = shared.clone();
+                        let font_base = font_base.clone();
+                        let callbacks = callbacks.clone();
+                        esc.add_shortcut(gtk4::Shortcut::new(
+                            Some(trigger),
+                            Some(gtk4::CallbackAction::new(move |_, _| {
+                                nudge_font_scale(&shared, &font_base, &callbacks, step);
+                                glib::Propagation::Stop
+                            })),
+                        ));
+                    }
+                }
+                if let Some(trigger) = gtk4::ShortcutTrigger::parse_string("<Control>0") {
+                    let callbacks = callbacks.clone();
+                    esc.add_shortcut(gtk4::Shortcut::new(
+                        Some(trigger),
+                        Some(gtk4::CallbackAction::new(move |_, _| {
+                            (callbacks.on_font_scale)(None);
+                            glib::Propagation::Stop
+                        })),
+                    ));
+                }
+            }
             window.add_controller(esc);
         }
 
@@ -639,7 +852,19 @@ impl NoteWindow {
             x11_desktop,
             margins,
             custom_css,
+            font_class,
+            font_css,
+            font_base,
+            font_reset,
+            tag_colors,
+            tagbar,
+            tag_add,
+            tag_entry,
+            shared,
+            callbacks,
         };
+        // Initial text scale: the note's override, else the global.
+        this.apply_font_scale(this.effective_scale());
         // Route through the shared helper so named and custom hex colors
         // share one path (custom colors need a dynamic provider).
         apply_color_to(&this.window, initial_display, &this.custom_css, &color);
@@ -661,6 +886,53 @@ impl NoteWindow {
             color_display(&self.window, self.x11_desktop),
             &self.custom_css,
             color,
+        );
+    }
+
+    /// Text scale actually in force: the note's override, if any,
+    /// else the global scale.
+    pub fn effective_scale(&self) -> f32 {
+        clamp_font_scale(
+            self.shared
+                .note
+                .borrow()
+                .font_scale
+                .unwrap_or_else(|| self.font_base.get()),
+        )
+    }
+
+    /// Restyle the window's text at `scale`, swapping the previous
+    /// provider. The toolbar reset button doubles as the indicator.
+    pub fn apply_font_scale(&self, scale: f32) {
+        let scale = clamp_font_scale(scale);
+        swap_font_provider(
+            &self.window,
+            self.x11_desktop,
+            &self.font_css,
+            &self.font_class,
+            scale,
+        );
+        self.font_reset
+            .set_label(&format!("{}%", (scale * 100.0).round() as i32));
+    }
+
+    /// The global scale changed: remember it and re-derive this
+    /// note's effective scale.
+    pub fn set_base_scale(&self, base: f32) {
+        self.font_base.set(clamp_font_scale(base));
+        self.apply_font_scale(self.effective_scale());
+    }
+
+    /// The settings tag-color map changed: shadow it and repaint pills.
+    pub fn set_tag_colors(&self, colors: &HashMap<String, String>) {
+        *self.tag_colors.borrow_mut() = colors.clone();
+        rebuild_tagbar(
+            &self.tagbar,
+            &self.tag_add,
+            &self.tag_entry,
+            &self.shared,
+            &self.tag_colors,
+            &self.callbacks,
         );
     }
 
@@ -918,6 +1190,292 @@ fn append_drop(buffer: &TextBuffer, text: &str) {
     buffer.place_cursor(&end);
 }
 
+/// Clamp a text scale into the supported range; garbage (NaN,
+/// infinite, hand-edited settings) falls back to 1.0.
+pub fn clamp_font_scale(scale: f32) -> f32 {
+    if scale.is_finite() {
+        scale.clamp(0.5, 3.0)
+    } else {
+        1.0
+    }
+}
+
+/// Swap the window's text-scale provider for one rendering `scale`
+/// on its unique font class (specificity beats the shared
+/// stylesheet's body rule without touching other windows).
+fn swap_font_provider(
+    window: &gtk4::Window,
+    x11_desktop: bool,
+    slot: &RefCell<Option<gtk4::CssProvider>>,
+    class: &str,
+    scale: f32,
+) {
+    if let Some(old) = slot.borrow_mut().take() {
+        if let Some(display) = color_display(window, x11_desktop) {
+            gtk4::style_context_remove_provider_for_display(&display, &old);
+        }
+    }
+    let provider = gtk4::CssProvider::new();
+    provider.load_from_data(&format!(
+        ".{class} textview.pinlet-body text {{ font-size: {:.1}pt; }}",
+        14.0 * scale
+    ));
+    if let Some(display) = color_display(window, x11_desktop) {
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+    *slot.borrow_mut() = Some(provider);
+}
+
+/// Step the effective scale by `delta` and store it as the note's
+/// override. Tenths keep repeated presses exact. Shared by the
+/// toolbar buttons and the keyboard shortcuts.
+fn nudge_font_scale(
+    shared: &Rc<SharedNote>,
+    base: &Rc<Cell<f32>>,
+    callbacks: &Rc<NoteCallbacks>,
+    delta: f32,
+) {
+    let current = shared
+        .note
+        .borrow()
+        .font_scale
+        .unwrap_or_else(|| base.get());
+    let stepped = ((current * 10.0).round() + delta * 10.0).round() / 10.0;
+    (callbacks.on_font_scale)(Some(clamp_font_scale(stepped)));
+}
+
+/// Build the Markdown toolbar: format buttons, then text-size controls.
+fn build_toolbar(
+    toolbar: &gtk4::Box,
+    edit_view: &TextView,
+    shared: &Rc<SharedNote>,
+    base: &Rc<Cell<f32>>,
+    reset: &Button,
+    callbacks: &Rc<NoteCallbacks>,
+) {
+    let buffer = edit_view.buffer();
+    let wrap = |label: &str, tooltip: &str, pre: &'static str, suf: &'static str| {
+        let button = Button::with_label(label);
+        button.set_tooltip_text(Some(tooltip));
+        let buffer = buffer.clone();
+        button.connect_clicked(move |_| wrap_selection(&buffer, pre, suf));
+        toolbar.append(&button);
+    };
+    wrap("B", "Bold", "**", "**");
+    wrap("I", "Italic", "*", "*");
+    wrap("S", "Strikethrough", "~~", "~~");
+    wrap("🔗", "Link", "[", "](https://)");
+
+    let prefix = |label: &str, tooltip: &str, marker: &'static str| {
+        let button = Button::with_label(label);
+        button.set_tooltip_text(Some(tooltip));
+        let buffer = buffer.clone();
+        button.connect_clicked(move |_| {
+            replace_lines(&buffer, |text| toggle_prefix_all(text, marker));
+        });
+        toolbar.append(&button);
+    };
+    prefix("H", "Heading", "## ");
+    prefix(">", "Quote", "> ");
+    prefix("•", "Bullet list", "- ");
+
+    // Code: backticks for one line, a fence for several.
+    {
+        let code = Button::with_label("</>");
+        code.set_tooltip_text(Some("Code"));
+        let buffer = buffer.clone();
+        code.connect_clicked(move |_| {
+            let multiline = buffer
+                .selection_bounds()
+                .is_some_and(|(start, end)| start.line() != end.line());
+            if multiline {
+                wrap_selection(&buffer, "```\n", "\n```");
+            } else {
+                wrap_selection(&buffer, "`", "`");
+            }
+        });
+        toolbar.append(&code);
+    }
+
+    // Task list: toggle the covered lines between task and plain.
+    {
+        let task = Button::with_label("☑");
+        task.set_tooltip_text(Some("Checklist item"));
+        let buffer = buffer.clone();
+        task.connect_clicked(move |_| {
+            replace_lines(&buffer, toggle_task_all);
+        });
+        toolbar.append(&task);
+    }
+
+    toolbar.append(&gtk4::Separator::new(Orientation::Vertical));
+
+    let spacer = gtk4::Box::new(Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    toolbar.append(&spacer);
+
+    // Per-note text size: smaller, reset-to-global (doubling as the
+    // current-scale indicator), larger.
+    {
+        let smaller = Button::with_label("A−");
+        smaller.set_tooltip_text(Some("Smaller text (Ctrl+-)"));
+        let shared = shared.clone();
+        let base = base.clone();
+        let callbacks = callbacks.clone();
+        smaller.connect_clicked(move |_| nudge_font_scale(&shared, &base, &callbacks, -0.1));
+        toolbar.append(&smaller);
+    }
+    {
+        let callbacks = callbacks.clone();
+        reset.connect_clicked(move |_| (callbacks.on_font_scale)(None));
+        toolbar.append(reset);
+    }
+    {
+        let larger = Button::with_label("A+");
+        larger.set_tooltip_text(Some("Larger text (Ctrl++)"));
+        let shared = shared.clone();
+        let base = base.clone();
+        let callbacks = callbacks.clone();
+        larger.connect_clicked(move |_| nudge_font_scale(&shared, &base, &callbacks, 0.1));
+        toolbar.append(&larger);
+    }
+}
+
+/// Wrap the selection (or an empty cursor spot) in `pre`/`suf` in one
+/// undo step. With no selection the cursor lands between the two.
+fn wrap_selection(buffer: &TextBuffer, pre: &str, suf: &str) {
+    buffer.begin_user_action();
+    if let Some((mut start, mut end)) = buffer.selection_bounds() {
+        let selected = buffer.text(&start, &end, true).to_string();
+        buffer.delete(&mut start, &mut end);
+        buffer.insert(&mut start, &format!("{pre}{selected}{suf}"));
+    } else {
+        let mut at = buffer.iter_at_mark(&buffer.get_insert());
+        buffer.insert(&mut at, &format!("{pre}{suf}"));
+        at.backward_chars(suf.chars().count() as i32);
+        buffer.place_cursor(&at);
+    }
+    buffer.end_user_action();
+}
+
+/// Apply `f` to the full lines covered by the selection (or the
+/// cursor line), replacing them in one undo step. A selection ending
+/// exactly at a line start excludes that line.
+fn replace_lines(buffer: &TextBuffer, f: impl FnOnce(&str) -> String) {
+    let (start, end) = match buffer.selection_bounds() {
+        Some((start, end)) => (start, end),
+        None => {
+            let cursor = buffer.iter_at_mark(&buffer.get_insert());
+            (cursor, cursor)
+        }
+    };
+    let mut from = start;
+    from.set_line_offset(0);
+    let mut to = end;
+    if to.line() != from.line() && to.starts_line() {
+        to.backward_char();
+    }
+    to.forward_to_line_end();
+    let text = buffer.text(&from, &to, true).to_string();
+    buffer.begin_user_action();
+    buffer.delete(&mut from, &mut to);
+    buffer.insert(&mut from, &f(&text));
+    buffer.end_user_action();
+}
+
+/// Toggle `prefix` on every non-empty line: strip it when all carry
+/// it, otherwise add it to the lines missing it.
+fn toggle_prefix_all(text: &str, prefix: &str) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let targets: Vec<&&str> = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if targets.is_empty() {
+        return text.to_owned();
+    }
+    if targets.iter().all(|line| line.starts_with(prefix)) {
+        lines
+            .iter()
+            .map(|line| line.strip_prefix(prefix).unwrap_or(line).to_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        lines
+            .iter()
+            .map(|line| {
+                if line.trim().is_empty() || line.starts_with(prefix) {
+                    (*line).to_owned()
+                } else {
+                    format!("{prefix}{line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// Toggle one source line between task item and plain line: a task
+/// marker is stripped (keeping the bullet), a bare bullet gains
+/// `[ ]`, anything else becomes a `- [ ]` task.
+fn toggle_task_line(line: &str) -> String {
+    if let Some((byte, _)) = find_checkbox(line) {
+        let mut out = line.to_owned();
+        let take = if line[byte + 3..].starts_with(' ') {
+            4
+        } else {
+            3
+        };
+        out.replace_range(byte..byte + take, "");
+        out
+    } else {
+        let indent_len = line.len() - line.trim_start_matches([' ', '\t']).len();
+        let (indent, rest) = line.split_at(indent_len);
+        if rest.starts_with("- ") || rest.starts_with("* ") || rest.starts_with("+ ") {
+            format!("{indent}{}[ ] {}", &rest[..2], &rest[2..])
+        } else {
+            format!("{indent}- [ ] {rest}")
+        }
+    }
+}
+
+/// Toggle task state across lines, mirroring [`toggle_prefix_all`]:
+/// strip when every non-empty line is a task, otherwise complete the
+/// lines missing a marker.
+fn toggle_task_all(text: &str) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let targets: Vec<&&str> = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if targets.is_empty() {
+        return text.to_owned();
+    }
+    if targets.iter().all(|line| find_checkbox(line).is_some()) {
+        lines
+            .iter()
+            .map(|line| toggle_task_line(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        lines
+            .iter()
+            .map(|line| {
+                if line.trim().is_empty() || find_checkbox(line).is_some() {
+                    (*line).to_owned()
+                } else {
+                    toggle_task_line(line)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 /// Re-render the preview view from the edit buffer's current source.
 fn refresh_preview(edit_view: &TextView, preview_view: &TextView, styler: &MarkdownStyler) {
     let buffer = edit_view.buffer();
@@ -989,6 +1547,260 @@ fn toggle_checkbox_at(edit_view: &TextView, preview_view: &TextView, at: &gtk4::
     true
 }
 
+/// Words and characters in `text` for the footer.
+fn count_words(text: &str) -> (usize, usize) {
+    (text.split_whitespace().count(), text.chars().count())
+}
+
+/// Refresh the footer label from the buffer's current text.
+fn update_counts(buffer: &TextBuffer, label: &Label) {
+    let text = buffer
+        .text(&buffer.start_iter(), &buffer.end_iter(), true)
+        .to_string();
+    let (words, chars) = count_words(&text);
+    label.set_text(&format!("{words} words · {chars} characters"));
+}
+
+/// Rebuild the footer pills from the note's tags. The plus button
+/// and inline entry are separate and survive rebuilds, so typing
+/// focus is never lost; both hide once the note carries
+/// [`Note::MAX_TAGS`] tags.
+fn rebuild_tagbar(
+    tagbar: &gtk4::Box,
+    tag_add: &Button,
+    tag_entry: &gtk4::Entry,
+    shared: &Rc<SharedNote>,
+    colors: &Rc<RefCell<HashMap<String, String>>>,
+    callbacks: &Rc<NoteCallbacks>,
+) {
+    while let Some(child) = tagbar.first_child() {
+        tagbar.remove(&child);
+    }
+    let tags = shared.note.borrow().tags.clone();
+    for tag in &tags {
+        tagbar.append(&tag_pill(
+            tag, tagbar, tag_add, tag_entry, shared, colors, callbacks,
+        ));
+    }
+    let capped = tags.len() >= Note::MAX_TAGS;
+    tag_add.set_visible(!capped);
+    if capped {
+        tag_entry.set_text("");
+        tag_entry.set_visible(false);
+    }
+}
+
+/// One tag pill: `#name` opens its color swatches, `×` removes it.
+fn tag_pill(
+    tag: &str,
+    tagbar: &gtk4::Box,
+    tag_add: &Button,
+    tag_entry: &gtk4::Entry,
+    shared: &Rc<SharedNote>,
+    colors: &Rc<RefCell<HashMap<String, String>>>,
+    callbacks: &Rc<NoteCallbacks>,
+) -> gtk4::Box {
+    let pill = gtk4::Box::new(Orientation::Horizontal, 0);
+    pill.add_css_class("pinlet-tag");
+    let color = colors
+        .borrow()
+        .get(tag)
+        .cloned()
+        .unwrap_or_else(|| colors::default_tag_color(tag).to_owned());
+    pill.add_css_class(&colors::tag_css_class(&color));
+    let name = Label::new(Some(&format!("#{tag}")));
+    pill.append(&name);
+
+    let remove = Button::with_label("×");
+    remove.add_css_class("pinlet-tag-x");
+    remove.set_tooltip_text(Some("Remove tag"));
+    {
+        let tag = tag.to_owned();
+        let bar = tagbar.clone();
+        let add = tag_add.clone();
+        let entry = tag_entry.clone();
+        let shared = shared.clone();
+        let colors = colors.clone();
+        let callbacks = callbacks.clone();
+        remove.connect_clicked(move |_| {
+            let tags: Vec<String> = shared
+                .note
+                .borrow()
+                .tags
+                .iter()
+                .filter(|existing| *existing != &tag)
+                .cloned()
+                .collect();
+            (callbacks.on_tags_changed)(tags);
+            rebuild_tagbar(&bar, &add, &entry, &shared, &colors, &callbacks);
+        });
+    }
+    pill.append(&remove);
+    pill
+}
+
+/// Flip the task marker on edit-buffer `line` when `offset` sits on
+/// (or next to) it — the editor mirror of the preview click. One
+/// undo step; false when no marker is there.
+fn toggle_editor_checkbox(buffer: &TextBuffer, line: i32, offset: i32) -> bool {
+    let Some(line_start) = buffer.iter_at_line(line) else {
+        return false;
+    };
+    let mut line_end = line_start;
+    line_end.forward_to_line_end();
+    let text = buffer.text(&line_start, &line_end, true).to_string();
+    let Some((byte, _)) = find_checkbox(&text) else {
+        return false;
+    };
+    let col = text[..byte].chars().count() as i32;
+    if offset.abs_diff(col) > 1 {
+        return false;
+    }
+    let checked = text.as_bytes()[byte + 1] != b' ';
+    let replacement = if checked { "[ ]" } else { "[x]" };
+    let mut from = line_start;
+    from.forward_chars(col);
+    let mut to = from;
+    to.forward_chars(3);
+    buffer.begin_user_action();
+    buffer.delete(&mut from, &mut to);
+    buffer.insert(&mut from, replacement);
+    buffer.end_user_action();
+    true
+}
+
+/// What Enter does on the split list-item line: continue it, remove
+/// an empty item, or nothing for plain lines.
+enum EnterAction {
+    /// Insert this prefix on the new line.
+    Continue(String),
+    /// The item is empty: remove its whole line.
+    RemoveItem,
+    /// Not a continued list: leave the newline alone.
+    Nothing,
+}
+
+/// An ordered-list bullet (`12.` / `3)` + blank): its number, the
+/// delimiter, and the bullet length through the delimiter.
+fn ordered_marker(rest: &str) -> Option<(u64, char, usize)> {
+    let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    let delim = *rest
+        .as_bytes()
+        .get(digits)
+        .filter(|byte| **byte == b'.' || **byte == b')')?;
+    if !rest[digits + 1..].starts_with([' ', '\t']) {
+        return None;
+    }
+    let number: u64 = rest[..digits].parse().ok()?;
+    Some((number, delim as char, digits + 1))
+}
+
+/// Classify the line Enter just split. Ordered items continue with
+/// the next number — following lines keep theirs; only the fresh
+/// line is numbered.
+fn enter_action(line: &str) -> EnterAction {
+    let indent_len = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let (indent, rest) = line.split_at(indent_len);
+    if let Some((number, delim, through_delim)) = ordered_marker(rest) {
+        let next = number.saturating_add(1);
+        let bytes = line.as_bytes();
+        let mut content_start = indent_len + through_delim;
+        while bytes
+            .get(content_start)
+            .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
+        {
+            content_start += 1;
+        }
+        if is_checkbox_at(bytes, content_start) {
+            if line[content_start + 3..].trim().is_empty() {
+                return EnterAction::RemoveItem;
+            }
+            return EnterAction::Continue(format!("{indent}{next}{delim} [ ] "));
+        }
+        if line[content_start..].trim().is_empty() {
+            return EnterAction::RemoveItem;
+        }
+        return EnterAction::Continue(format!("{indent}{next}{delim} "));
+    }
+    if let Some((byte, _)) = find_checkbox(line) {
+        let content = line[byte + 3..].trim();
+        if content.is_empty() {
+            return EnterAction::RemoveItem;
+        }
+        let mut prefix = line[..byte].to_owned();
+        prefix.push_str("[ ] ");
+        return EnterAction::Continue(prefix);
+    }
+    if rest.starts_with("- ") || rest.starts_with("* ") || rest.starts_with("+ ") {
+        if rest[2..].trim().is_empty() {
+            return EnterAction::RemoveItem;
+        }
+        return EnterAction::Continue(format!("{indent}{} ", &rest[..1]));
+    }
+    EnterAction::Nothing
+}
+
+/// Wire Enter continuation on an edit buffer: Enter on a task,
+/// bullet, or ordered item continues it on the next line; Enter on
+/// an empty item removes the item instead. The continuation runs on
+/// idle, not inside the emission: mutating the buffer synchronously
+/// invalidates iterators GTK still holds for the in-flight keypress
+/// ("Invalid text buffer iterator"). The position crosses into the
+/// idle in a mark, resolved back to a line number there. `pub(crate)`
+/// so the regression scenario can drive the real wiring headlessly.
+pub(crate) fn wire_list_continuation(buffer: &TextBuffer) {
+    buffer.connect_insert_text(move |buffer, _location, text| {
+        if text != "\n" {
+            return;
+        }
+        // Right gravity: the mark rides past the newline to the
+        // fresh line's start.
+        let cursor = buffer.iter_at_mark(&buffer.get_insert());
+        let mark = buffer.create_mark(None, &cursor, false);
+        let cont = buffer.clone();
+        glib::idle_add_local_once(move || {
+            let at = cont.iter_at_mark(&mark);
+            cont.delete_mark(&mark);
+            continue_list_at(&cont, at.line());
+        });
+    });
+}
+
+/// Continue (or collapse) the list item above `line`, the fresh line
+/// Enter opened. Positions are re-derived from line numbers, never
+/// carried across edits as iterators.
+fn continue_list_at(buffer: &TextBuffer, line: i32) {
+    if line <= 0 {
+        return;
+    }
+    let Some(item_start) = buffer.iter_at_line(line - 1) else {
+        return;
+    };
+    let mut item_end = item_start;
+    item_end.forward_to_line_end();
+    let text = buffer.text(&item_start, &item_end, true).to_string();
+    let Some(fresh_start) = buffer.iter_at_line(line) else {
+        return;
+    };
+    match enter_action(&text) {
+        EnterAction::Nothing => {}
+        EnterAction::Continue(prefix) => {
+            buffer.begin_user_action();
+            let mut at = fresh_start;
+            buffer.insert(&mut at, &prefix);
+            buffer.end_user_action();
+        }
+        EnterAction::RemoveItem => {
+            // Delete the empty item's line plus the newline after it.
+            buffer.begin_user_action();
+            let mut from = item_start;
+            let mut to = fresh_start;
+            buffer.delete(&mut from, &mut to);
+            buffer.end_user_action();
+        }
+    }
+}
+
 /// Byte offset of the task-list marker on a source line: the
 /// `[ ]`/`[x]`/`[X]` following the list bullet, or the first such
 /// bracket group when the bullet doesn't parse (defensive: the
@@ -1040,7 +1852,7 @@ fn first_bracket_group(line: &str) -> Option<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::find_checkbox;
+    use super::{EnterAction, find_checkbox};
 
     #[test]
     fn checkbox_found_after_bullets() {
@@ -1061,5 +1873,99 @@ mod tests {
         assert_eq!(find_checkbox("no box here"), None);
         assert_eq!(find_checkbox("- just a dash"), None);
         assert_eq!(find_checkbox(""), None);
+    }
+
+    #[test]
+    fn prefix_toggle_adds_and_strips() {
+        assert_eq!(super::toggle_prefix_all("a\nb", "## "), "## a\n## b");
+        assert_eq!(super::toggle_prefix_all("## a\n## b", "## "), "a\nb");
+        // Mixed: complete the missing lines, keep empty ones bare.
+        assert_eq!(
+            super::toggle_prefix_all("## a\nb\n\nc", "## "),
+            "## a\n## b\n\n## c"
+        );
+        assert_eq!(super::toggle_prefix_all("", "## "), "");
+    }
+
+    #[test]
+    fn task_toggle_converts_lines() {
+        assert_eq!(super::toggle_task_line("- [ ] foo"), "- foo");
+        assert_eq!(super::toggle_task_line("- [x] foo"), "- foo");
+        assert_eq!(super::toggle_task_line("- foo"), "- [ ] foo");
+        assert_eq!(super::toggle_task_line("plain"), "- [ ] plain");
+        assert_eq!(super::toggle_task_line("  * [X] star"), "  * star");
+        // All tasks: strip; otherwise complete.
+        assert_eq!(super::toggle_task_all("- [ ] a\n- [x] b"), "- a\n- b");
+        assert_eq!(super::toggle_task_all("- [ ] a\n- b"), "- [ ] a\n- [ ] b");
+    }
+
+    #[test]
+    fn enter_continues_or_collapses_lists() {
+        assert!(matches!(
+            super::enter_action("- [ ] buy milk"),
+            EnterAction::Continue(prefix) if prefix == "- [ ] "
+        ));
+        assert!(matches!(
+            super::enter_action("  * [x] done"),
+            EnterAction::Continue(prefix) if prefix == "  * [ ] "
+        ));
+        assert!(matches!(
+            super::enter_action("- just a bullet"),
+            EnterAction::Continue(prefix) if prefix == "- "
+        ));
+        assert!(matches!(
+            super::enter_action("- [ ]"),
+            EnterAction::RemoveItem
+        ));
+        assert!(matches!(super::enter_action("- "), EnterAction::RemoveItem));
+        assert!(matches!(
+            super::enter_action("plain text"),
+            EnterAction::Nothing
+        ));
+        // Ordered items continue with the next number, keeping the
+        // delimiter style; empty ones collapse like bullets.
+        assert!(matches!(
+            super::enter_action("1. first"),
+            EnterAction::Continue(prefix) if prefix == "2. "
+        ));
+        assert!(matches!(
+            super::enter_action("  12) second"),
+            EnterAction::Continue(prefix) if prefix == "  13) "
+        ));
+        assert!(matches!(
+            super::enter_action("2) [ ] task"),
+            EnterAction::Continue(prefix) if prefix == "3) [ ] "
+        ));
+        assert!(matches!(
+            super::enter_action("1. "),
+            EnterAction::RemoveItem
+        ));
+        assert!(matches!(
+            super::enter_action("1. [ ]"),
+            EnterAction::RemoveItem
+        ));
+        // Not a list without a blank after the marker; unparseable
+        // numbers stay untouched.
+        assert!(matches!(super::enter_action("1.foo"), EnterAction::Nothing));
+        assert!(matches!(
+            super::enter_action("99999999999999999999999. big"),
+            EnterAction::Nothing
+        ));
+    }
+
+    #[test]
+    fn counts_split_words_and_chars() {
+        assert_eq!(super::count_words(""), (0, 0));
+        assert_eq!(super::count_words("hello world"), (2, 11));
+        assert_eq!(super::count_words("  a\nb  "), (2, 7));
+    }
+
+    #[test]
+    fn font_scale_clamps_and_rejects_garbage() {
+        assert_eq!(super::clamp_font_scale(1.2), 1.2);
+        assert_eq!(super::clamp_font_scale(0.1), 0.5);
+        assert_eq!(super::clamp_font_scale(9.0), 3.0);
+        assert_eq!(super::clamp_font_scale(f32::NAN), 1.0);
+        assert_eq!(super::clamp_font_scale(f32::INFINITY), 1.0);
     }
 }

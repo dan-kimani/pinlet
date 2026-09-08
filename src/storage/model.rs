@@ -238,6 +238,20 @@ pub struct Note {
     /// Scheduled alarms for this note.
     #[serde(default)]
     pub reminders: Vec<Reminder>,
+    /// User-assigned labels (frontmatter; empty means untagged).
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// In the trash instead of permanently deleted: hidden
+    /// everywhere until restored or emptied.
+    #[serde(default)]
+    pub is_trashed: bool,
+    /// When the note entered the trash, if ever.
+    #[serde(default)]
+    pub trashed_at: Option<DateTime<Utc>>,
+    /// Per-note text scale multiplier. `None` follows the global
+    /// font scale in settings.
+    #[serde(default)]
+    pub font_scale: Option<f32>,
 }
 
 impl Note {
@@ -254,7 +268,44 @@ impl Note {
             created_at: Some(now),
             updated_at: Some(now),
             reminders: Vec::new(),
+            tags: Vec::new(),
+            is_trashed: false,
+            trashed_at: None,
+            font_scale: None,
         }
+    }
+
+    /// Longest tag the UI accepts; longer input is rejected rather
+    /// than silently truncated into a different tag.
+    pub const MAX_TAG_LEN: usize = 32;
+
+    /// Most tags a note carries. The UI hides the add control at the
+    /// cap; cleaning truncates defensively past it.
+    pub const MAX_TAGS: usize = 2;
+
+    /// Clean user-supplied tags for storage: normalized, deduplicated
+    /// (first occurrence wins), capped at [`Self::MAX_TAGS`].
+    pub fn clean_tags(raw: Vec<String>) -> Vec<String> {
+        let mut clean = Vec::new();
+        for item in raw {
+            if let Some(tag) = Self::normalize_tag(&item) {
+                if !clean.contains(&tag) {
+                    clean.push(tag);
+                }
+            }
+        }
+        clean.truncate(Self::MAX_TAGS);
+        clean
+    }
+
+    /// Normalize a user-typed tag: trimmed, non-empty, bounded.
+    /// `None` means the input is not a usable tag.
+    pub fn normalize_tag(raw: &str) -> Option<String> {
+        let tag = raw.trim();
+        if tag.is_empty() || tag.chars().count() > Self::MAX_TAG_LEN {
+            return None;
+        }
+        Some(tag.to_owned())
     }
 
     /// Derive the note title from its body: the first non-empty line.
@@ -429,5 +480,52 @@ mod tests {
         assert_eq!(Note::derive_title("\n\n  Groceries  \nmore"), "Groceries");
         assert_eq!(Note::derive_title(""), "");
         assert_eq!(Note::derive_title("   \n  \n"), "");
+    }
+
+    #[test]
+    fn tag_cleaning_dedupes_and_caps() {
+        let cleaned = Note::clean_tags(vec![
+            "  work ".to_owned(),
+            "work".to_owned(),
+            "".to_owned(),
+            "home".to_owned(),
+            "extra".to_owned(),
+        ]);
+        assert_eq!(cleaned, vec!["work".to_owned(), "home".to_owned()]);
+    }
+
+    #[test]
+    fn tag_input_trims_and_rejects_garbage() {
+        assert_eq!(Note::normalize_tag("  work  "), Some("work".to_owned()));
+        assert_eq!(Note::normalize_tag(""), None);
+        assert_eq!(Note::normalize_tag("   "), None);
+        assert_eq!(Note::normalize_tag(&"x".repeat(33)), None);
+        assert_eq!(Note::normalize_tag(&"x".repeat(32)), Some("x".repeat(32)));
+    }
+
+    #[test]
+    fn new_fields_round_trip_and_default() {
+        let mut note = Note::new(Uuid::new_v4(), NoteColor::Yellow);
+        note.tags = vec!["work".to_owned(), "home".to_owned()];
+        note.is_trashed = true;
+        note.trashed_at = Some(Utc::now());
+        note.font_scale = Some(1.2);
+        let rendered = render_file(&note, "body").unwrap();
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("pinlet-test-{}.md", Uuid::new_v4()));
+        std::fs::write(&path, &rendered).unwrap();
+        let (parsed, _) = parse_note_file(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(parsed.tags, note.tags);
+        assert!(parsed.is_trashed);
+        assert!(parsed.trashed_at.is_some());
+        assert_eq!(parsed.font_scale, Some(1.2));
+
+        // Old files without the keys still load.
+        let legacy: Note = serde_yaml_ng::from_str(&format!("id: {}", note.id)).unwrap();
+        assert!(legacy.tags.is_empty());
+        assert!(!legacy.is_trashed);
+        assert!(legacy.trashed_at.is_none());
+        assert!(legacy.font_scale.is_none());
     }
 }

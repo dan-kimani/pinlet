@@ -39,6 +39,11 @@ pub struct Settings {
     pub git_commit_interval_min: u64,
     /// Minutes between automatic pushes (full syncs) while syncing (0 = off).
     pub git_push_interval_min: u64,
+    /// Global note text scale multiplier (per-note overrides possible).
+    pub font_scale: f32,
+    /// Per-tag palette color overrides, keyed by tag name. Tags
+    /// without an entry use their deterministic palette color.
+    pub tag_colors: std::collections::HashMap<String, String>,
 }
 
 impl Default for Settings {
@@ -55,6 +60,8 @@ impl Default for Settings {
             git_branch: "main".to_owned(),
             git_commit_interval_min: 5,
             git_push_interval_min: 15,
+            font_scale: 1.0,
+            tag_colors: std::collections::HashMap::new(),
         }
     }
 }

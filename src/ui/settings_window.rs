@@ -23,6 +23,8 @@ pub struct SettingsCallbacks {
     pub on_sync_dark_mode: Box<dyn Fn(bool)>,
     /// Auto-save debounce in milliseconds.
     pub on_auto_save_debounce: Box<dyn Fn(u64)>,
+    /// Global note text scale changed (per-note overrides stay).
+    pub on_global_font_scale: Box<dyn Fn(f32)>,
     /// Global capture shortcut enabled.
     pub on_enable_shortcut: Box<dyn Fn(bool)>,
     /// Start on login.
@@ -52,6 +54,12 @@ const COLOR_NAMES: [&str; 6] = ["Yellow", "Green", "Blue", "Pink", "Purple", "Ch
 
 /// Auto-save debounce presets, in milliseconds.
 const SAVE_DELAYS_MS: [u64; 4] = [500, 1000, 2000, 5000];
+
+/// Global text-scale presets, as multipliers.
+const FONT_SCALES: [f32; 6] = [0.8, 0.9, 1.0, 1.1, 1.25, 1.5];
+
+/// Human-readable labels for the text-scale presets.
+const FONT_SCALE_LABELS: [&str; 6] = ["80%", "90%", "100%", "110%", "125%", "150%"];
 
 /// Human-readable labels for the auto-save presets, matching [`SAVE_DELAYS_MS`].
 const SAVE_DELAY_LABELS: [&str; 4] = ["0.5 s", "1 s", "2 s", "5 s"];
@@ -142,6 +150,20 @@ impl SettingsWindow {
             });
         }
         appearance_group.add(&dark_row);
+
+        let font_row = ComboRow::builder()
+            .title("Text size")
+            .subtitle("Global note text size (notes can override it)")
+            .model(&gtk4::StringList::new(&FONT_SCALE_LABELS))
+            .selected(font_scale_index(settings.font_scale))
+            .build();
+        {
+            let callbacks = callbacks.clone();
+            font_row.connect_selected_notify(move |row| {
+                (callbacks.on_global_font_scale)(FONT_SCALES[row.selected() as usize]);
+            });
+        }
+        appearance_group.add(&font_row);
         page.add(&appearance_group);
 
         let editing_group = PreferencesGroup::builder().title("Editing").build();
@@ -423,6 +445,21 @@ fn save_delay_index(ms: u64) -> u32 {
         .iter()
         .position(|&value| value == ms)
         .unwrap_or(0) as u32
+}
+
+/// Index of the preset nearest `scale` (hand-edited values snap to
+/// the closest entry instead of mis-selecting).
+fn font_scale_index(scale: f32) -> u32 {
+    FONT_SCALES
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (**a - scale)
+                .abs()
+                .partial_cmp(&(**b - scale).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map_or(2, |(index, _)| index) as u32
 }
 
 /// Index of `minutes` in the sync interval presets, falling back to Off.

@@ -39,6 +39,19 @@ pub enum Msg {
         /// How many minutes to push it out.
         minutes: i64,
     },
+    /// Mark the fired reminder done: remove it so it never fires again.
+    MarkDone {
+        /// Owning note.
+        note: Uuid,
+        /// The reminder's due time (identity, as with snooze).
+        due: DateTime<Utc>,
+    },
+    /// Restore a trashed note and reopen its window.
+    RestoreNote(Uuid),
+    /// Permanently delete a trashed note (its git history remains).
+    DeleteForever(Uuid),
+    /// Permanently delete every trashed note.
+    EmptyTrash,
     /// Open the preferences window.
     OpenSettings,
     /// Quit the application.

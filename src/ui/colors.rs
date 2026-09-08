@@ -46,6 +46,42 @@ pub fn is_valid_hex(hex: &str) -> bool {
     parse_hex(hex).is_some()
 }
 
+/// Tag pill palette: each tag gets one of these colors, either the
+/// deterministic default or the user's per-tag override (a palette
+/// name stored in settings). Backgrounds carry their own readable
+/// foreground so pills stay legible on any note color.
+pub const TAG_COLORS: [(&str, &str, &str); 8] = [
+    ("red", "#e57373", "#3d1010"),
+    ("orange", "#ffb74d", "#4a2c00"),
+    ("yellow", "#fff176", "#4a4523"),
+    ("green", "#a5d6a7", "#1f3d1c"),
+    ("blue", "#90caf9", "#173a54"),
+    ("purple", "#ce93d8", "#2e2354"),
+    ("pink", "#f48fb1", "#54203a"),
+    ("gray", "#bdbdbd", "#2b2b2b"),
+];
+
+/// CSS class for a tag pill in palette color `name`.
+pub fn tag_css_class(name: &str) -> String {
+    format!("pinlet-tag-{name}")
+}
+
+/// Deterministic palette color for a tag: stable across restarts
+/// without storing anything (a small FNV hash over the name).
+pub fn default_tag_color(tag: &str) -> &'static str {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in tag.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    TAG_COLORS[(hash as usize) % TAG_COLORS.len()].0
+}
+
+/// Whether `name` is a palette color a tag override may use.
+pub fn is_tag_color(name: &str) -> bool {
+    TAG_COLORS.iter().any(|(n, _, _)| *n == name)
+}
+
 /// Parse `#RRGGBB` into components.
 fn parse_hex(hex: &str) -> Option<(u8, u8, u8)> {
     let digits = hex.strip_prefix('#')?;
@@ -62,6 +98,7 @@ fn parse_hex(hex: &str) -> Option<(u8, u8, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn contrast_picks_dark_on_light_and_light_on_dark() {
@@ -72,5 +109,16 @@ mod tests {
     #[test]
     fn invalid_hex_falls_back_to_light_text() {
         assert_eq!(foreground_for("nonsense"), "#f5f5f5");
+    }
+
+    #[test]
+    fn tag_defaults_are_stable_and_in_palette() {
+        let names: HashSet<&str> = TAG_COLORS.iter().map(|(n, _, _)| *n).collect();
+        assert_eq!(names.len(), TAG_COLORS.len());
+        assert_eq!(default_tag_color("work"), default_tag_color("work"));
+        assert!(names.contains(default_tag_color("work")));
+        assert!(names.contains(default_tag_color("home")));
+        assert!(is_tag_color("blue"));
+        assert!(!is_tag_color("chartreuse"));
     }
 }

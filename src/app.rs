@@ -3,7 +3,7 @@
 //! (see [`crate::ui`]) is driven from here.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -101,6 +101,11 @@ struct AppInner {
     notes: RefCell<HashMap<Uuid, Rc<SharedNote>>>,
     /// Open window per note id.
     windows: RefCell<HashMap<Uuid, NoteWindow>>,
+    /// Windows closing under app management (trash, reopen): their
+    /// close-request handler must skip the save/commit path, which
+    /// the caller already ran — otherwise the managed commit message
+    /// is clobbered and an immediate commit fires.
+    closing_managed: RefCell<HashSet<Uuid>>,
     /// Pending debounced save timers, one per note.
     save_sources: RefCell<HashMap<Uuid, SourceId>>,
     /// Pending coalesced auto-commit timer.
@@ -237,6 +242,7 @@ impl App {
             settings_window: RefCell::new(None),
             notes: RefCell::new(notes),
             windows: RefCell::new(HashMap::new()),
+            closing_managed: RefCell::new(HashSet::new()),
             save_sources: RefCell::new(HashMap::new()),
             commit_source: RefCell::new(None),
             commit_message: RefCell::new(String::new()),
@@ -271,7 +277,14 @@ impl App {
     /// Open every note's window, honor the CLI quick-capture command,
     /// install accelerators, and start the reminder tick loop.
     pub fn activate(&self, cli: &cli::Cli) {
-        let ids: Vec<Uuid> = self.inner.notes.borrow().keys().copied().collect();
+        let ids: Vec<Uuid> = self
+            .inner
+            .notes
+            .borrow()
+            .values()
+            .filter(|shared| !shared.note.borrow().is_trashed)
+            .map(|shared| shared.note.borrow().id)
+            .collect();
         for id in ids {
             self.open_window(id);
         }
@@ -395,6 +408,10 @@ impl App {
             Msg::FocusNote(id) => self.open_note(id),
             Msg::ToggleAll => self.toggle_all(),
             Msg::Snooze { note, due, minutes } => self.snooze_reminder(note, due, minutes),
+            Msg::MarkDone { note, due } => self.resolve_reminder(note, due),
+            Msg::RestoreNote(id) => self.restore_note(id),
+            Msg::DeleteForever(id) => self.delete_note(id),
+            Msg::EmptyTrash => self.empty_trash(),
             Msg::OpenSettings => self.open_settings(),
             Msg::GitPull => self.git_pull(),
             Msg::GitPush => self.git_push(),
@@ -608,16 +625,20 @@ impl App {
         id
     }
 
-    /// Open a window for note `id`, wiring its callbacks.
+    /// Open a window for note `id`, wiring its callbacks. Trashed
+    /// notes never open windows; restore them first.
     fn open_window(&self, id: Uuid) {
         let shared = self
             .inner
             .notes
             .borrow()
             .get(&id)
-            .expect("note exists")
+            .filter(|shared| !shared.note.borrow().is_trashed)
+            .expect("note exists and is not trashed")
             .clone();
 
+        // A partial geometry entry (missing keys default to zero)
+        // falls back to the default size instead of a zero window.
         let geometry = self
             .inner
             .local_state
@@ -633,7 +654,7 @@ impl App {
             }),
             on_delete: Box::new({
                 let this = self.clone();
-                move || this.delete_note(id)
+                move || this.trash_note(id)
             }),
             on_new: Box::new({
                 let this = self.clone();
@@ -673,6 +694,14 @@ impl App {
                 let this = self.clone();
                 move || this.lock_or_unlock(id)
             }),
+            on_tags_changed: Box::new({
+                let this = self.clone();
+                move |tags| this.update_tags(id, tags)
+            }),
+            on_font_scale: Box::new({
+                let this = self.clone();
+                move |scale| this.set_note_font_scale(id, scale)
+            }),
         };
 
         let window = NoteWindow::new(
@@ -681,6 +710,8 @@ impl App {
             geometry,
             callbacks,
             self.inner.pin_backend,
+            self.inner.settings.borrow().tag_colors.clone(),
+            crate::ui::clamp_font_scale(self.inner.settings.borrow().font_scale),
         );
         self.inner.windows.borrow_mut().insert(id, window.clone());
         window.present();
@@ -872,7 +903,13 @@ impl App {
     /// desktop lives below regular windows, so it is unpinned first to let
     /// the window come to the front.
     fn open_note(&self, id: Uuid) {
-        if !self.inner.notes.borrow().contains_key(&id) {
+        if !self
+            .inner
+            .notes
+            .borrow()
+            .get(&id)
+            .is_some_and(|shared| !shared.note.borrow().is_trashed)
+        {
             return;
         }
         if self
@@ -913,6 +950,108 @@ impl App {
             } else {
                 window.present();
             }
+        }
+    }
+
+    /// Move the note to the trash instead of deleting it: flagged,
+    /// window closed, hidden everywhere until restored or emptied.
+    fn trash_note(&self, id: Uuid) {
+        let Some(shared) = self.inner.notes.borrow().get(&id).cloned() else {
+            return;
+        };
+        let title = shared.display_title();
+        {
+            let mut note = shared.note.borrow_mut();
+            note.is_trashed = true;
+            note.trashed_at = Some(Utc::now());
+        }
+        let window = self.inner.windows.borrow_mut().remove(&id);
+        if let Some(source) = self.inner.save_sources.borrow_mut().remove(&id) {
+            cancel_source(source);
+        }
+        // Persist through the normal path so the title, timestamps,
+        // and tray all stay consistent.
+        self.save_now(id);
+        *self.inner.commit_message.borrow_mut() = format!("Trash note '{title}'");
+        self.schedule_commit();
+        self.save_geometry();
+        // Close last: the close-request handler runs synchronously
+        // and touches the registries — no borrow may be held here.
+        // Managed close: the Trash commit above must survive.
+        if let Some(window) = window {
+            self.inner.closing_managed.borrow_mut().insert(id);
+            window.close();
+            self.inner.closing_managed.borrow_mut().remove(&id);
+        }
+    }
+
+    /// Restore a trashed note and reopen its window.
+    fn restore_note(&self, id: Uuid) {
+        let Some(shared) = self.inner.notes.borrow().get(&id).cloned() else {
+            return;
+        };
+        if !shared.note.borrow().is_trashed {
+            // Already out of the trash: just bring it forward.
+            self.open_note(id);
+            return;
+        }
+        {
+            let mut note = shared.note.borrow_mut();
+            note.is_trashed = false;
+            note.trashed_at = None;
+        }
+        let title = shared.display_title();
+        self.save_now(id);
+        *self.inner.commit_message.borrow_mut() = format!("Restore note '{title}'");
+        self.schedule_commit();
+        self.open_window(id);
+    }
+
+    /// Permanently delete every trashed note. Git history still holds
+    /// their content, like any other deletion.
+    fn empty_trash(&self) {
+        let ids: Vec<Uuid> = self
+            .inner
+            .notes
+            .borrow()
+            .values()
+            .filter(|shared| shared.note.borrow().is_trashed)
+            .map(|shared| shared.note.borrow().id)
+            .collect();
+        for id in ids {
+            self.delete_note(id);
+        }
+    }
+
+    /// Replace the note's tags (normalized, deduplicated, capped)
+    /// and persist.
+    fn update_tags(&self, id: Uuid, tags: Vec<String>) {
+        let clean = Note::clean_tags(tags);
+        if let Some(shared) = self.inner.notes.borrow().get(&id) {
+            shared.note.borrow_mut().tags = clean;
+        }
+        self.save_now(id);
+    }
+
+    /// Store the per-note text scale (`None` = follow global),
+    /// persist, and restyle the window.
+    fn set_note_font_scale(&self, id: Uuid, scale: Option<f32>) {
+        let scale = scale.map(crate::ui::clamp_font_scale);
+        if let Some(shared) = self.inner.notes.borrow().get(&id) {
+            shared.note.borrow_mut().font_scale = scale;
+        }
+        self.save_now(id);
+        if let Some(window) = self.inner.windows.borrow().get(&id) {
+            window.apply_font_scale(window.effective_scale());
+        }
+    }
+
+    /// Re-derive every window's text scale from the global setting.
+    /// Per-note overrides stay untouched.
+    fn apply_font_mode(&self) {
+        let base = crate::ui::clamp_font_scale(self.inner.settings.borrow().font_scale);
+        for window in self.inner.windows.borrow().values() {
+            window.set_base_scale(base);
         }
     }
 
@@ -1037,6 +1176,10 @@ impl App {
 
         for (id, shared) in self.inner.notes.borrow().iter() {
             let mut note = shared.note.borrow_mut();
+            if note.is_trashed {
+                // Trashed notes stay silent until restored.
+                continue;
+            }
             let title = note.title.clone();
             let mut dirty = false;
             for reminder in &mut note.reminders {
@@ -1086,9 +1229,10 @@ impl App {
         self.refresh_tray_snapshot();
     }
 
-    /// Fire a desktop notification with Open Note / Snooze / Dismiss
-    /// actions. If the notification hides on its own with no action taken,
-    /// the reminder is snoozed for five minutes so it resurfaces (spec §3.4).
+    /// Fire a desktop notification with Open Note / Snooze / Done /
+    /// Dismiss actions. If the notification hides on its own with no
+    /// action taken, the reminder is snoozed for five minutes so it
+    /// resurfaces (spec §3.4).
     fn notify_reminder(&self, id: Uuid, due: DateTime<Utc>, note_title: String) {
         let body = if note_title.is_empty() {
             "A note reminder is due".to_owned()
@@ -1102,6 +1246,7 @@ impl App {
             .body(&body)
             .action("open", "Open Note")
             .action("snooze", "Snooze 10m")
+            .action("done", "Mark done")
             .action("dismiss", "Dismiss")
             .timeout(notify_rust::Timeout::Milliseconds(10_000))
             .show()
@@ -1119,6 +1264,9 @@ impl App {
                                 due,
                                 minutes: 10,
                             });
+                        }
+                        "done" => {
+                            let _ = tx.send(Msg::MarkDone { note: id, due });
                         }
                         "dismiss" => {
                             // Explicit dismissal: do not reschedule.
@@ -1162,6 +1310,27 @@ impl App {
         self.save_now(id);
     }
 
+    /// Remove the fired reminder so it never fires again. The `due`
+    /// identifies the reminder the notification fired for; for a
+    /// recurring reminder that is the already-advanced next
+    /// occurrence, so marking done ends the whole series.
+    fn resolve_reminder(&self, note_id: Uuid, due: DateTime<Utc>) {
+        let removed = {
+            let Some(shared) = self.inner.notes.borrow().get(&note_id).cloned() else {
+                return;
+            };
+            let mut note = shared.note.borrow_mut();
+            note.reminders
+                .iter()
+                .position(|reminder| reminder.due_at == due)
+                .map(|index| note.reminders.remove(index))
+                .is_some()
+        };
+        if removed {
+            self.save_now(note_id);
+        }
+    }
+
     /// Snooze the reminder with this due time by `minutes`.
     fn snooze_reminder(&self, note_id: Uuid, due: DateTime<Utc>, minutes: i64) {
         let changed = {
@@ -1182,11 +1351,14 @@ impl App {
         }
     }
 
-    /// Keep the tray menu's upcoming-reminders and notes sections current.
+    /// Keep the tray menu's upcoming-reminders, notes, and trash
+    /// sections current. Trashed notes stay out of the notes and
+    /// reminders lists; they appear only in the trash section.
     fn refresh_tray_snapshot(&self) {
         let now = Utc::now();
         let mut upcoming = Vec::new();
         let mut notes = Vec::new();
+        let mut trash = Vec::new();
         for shared in self.inner.notes.borrow().values() {
             let note = shared.note.borrow();
             let title = if note.is_locked {
@@ -1194,6 +1366,10 @@ impl App {
             } else {
                 Note::derive_title(&shared.body.borrow())
             };
+            if note.is_trashed {
+                trash.push(crate::tray::TrayNote { id: note.id, title });
+                continue;
+            }
             notes.push(crate::tray::TrayNote {
                 id: note.id,
                 title: title.clone(),
@@ -1213,15 +1389,12 @@ impl App {
         }
         upcoming.sort_by_key(|reminder| reminder.due);
         upcoming.truncate(5);
-        notes.sort_by(|a, b| {
-            a.title
-                .to_lowercase()
-                .cmp(&b.title.to_lowercase())
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        crate::tray::sort_by_title(&mut notes);
+        crate::tray::sort_by_title(&mut trash);
         if let Ok(mut snapshot) = self.inner.tray_snapshot.lock() {
             snapshot.upcoming = upcoming;
             snapshot.notes = notes;
+            snapshot.trash = trash;
         }
     }
 
@@ -1274,6 +1447,13 @@ impl App {
                         let this = self.clone();
                         move |value| {
                             this.set_setting(|settings| settings.auto_save_debounce_ms = value)
+                        }
+                    }),
+                    on_global_font_scale: Box::new({
+                        let this = self.clone();
+                        move |value| {
+                            this.set_setting(|settings| settings.font_scale = value);
+                            this.apply_font_mode();
                         }
                     }),
                     on_enable_shortcut: Box::new({
@@ -1596,6 +1776,49 @@ mod tests {
         picking_two_colors_scenario();
         pinning_scenario();
         markdown_source_roundtrip();
+        enter_continuation_scenario();
+    }
+
+    /// Enter continuation through the real buffer wiring: task,
+    /// bullet, and ordered items continue; empty items collapse.
+    /// The continuation runs on idle, so the loop is pumped before
+    /// asserting. GTK warnings raised mid-scenario print to stderr,
+    /// so a regression here is visible in the test output.
+    fn enter_continuation_scenario() {
+        let buffer = gtk4::TextBuffer::new(None);
+        crate::ui::wire_list_continuation(&buffer);
+        let press_enter = |before: &str| {
+            buffer.set_text(before);
+            let end = buffer.end_iter();
+            buffer.place_cursor(&end);
+            let mut at = buffer.end_iter();
+            buffer.insert(&mut at, "\n");
+            while gtk4::glib::MainContext::default().iteration(false) {}
+            buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), true)
+                .to_string()
+        };
+        assert_eq!(press_enter("- [ ] buy milk"), "- [ ] buy milk\n- [ ] ");
+        assert_eq!(press_enter("- item"), "- item\n- ");
+        assert_eq!(press_enter("1. first"), "1. first\n2. ");
+        assert_eq!(press_enter("- [ ]"), "");
+        assert_eq!(press_enter("plain"), "plain\n");
+
+        // Typing ahead of the idle still lands inside the continued item.
+        buffer.set_text("- [ ] buy");
+        let end = buffer.end_iter();
+        buffer.place_cursor(&end);
+        let mut at = buffer.end_iter();
+        buffer.insert(&mut at, "\n");
+        let mut at = buffer.end_iter();
+        buffer.insert(&mut at, "more");
+        while gtk4::glib::MainContext::default().iteration(false) {}
+        assert_eq!(
+            buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), true)
+                .to_string(),
+            "- [ ] buy\n- [ ] more"
+        );
     }
 
     /// The Markdown styler must keep the hidden formatting markers in the

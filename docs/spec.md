@@ -82,7 +82,12 @@ A native, high-performance, and beautifully designed sticky notes application bu
 - **Frameless/Bordered Window Toggle**: Clean, minimalist window chrome styled to look like physical paper notes.
 - **Inline Color Selector Toolbar**: Header palette allows toggling individual note background colors (Canary Yellow, Mint Green, Sky Blue, Soft Pink, Lavender, Charcoal/Dark).
 - **Rich Text & Checklists**: Text buffers supporting word wrap, inline basic formatting, and interactive checkable boxes (`- [ ]`).
-- **Header Actions**: Quick access buttons for adding a new note (+), color theme picker, setting reminders (⏰), locking (🔒), pinning (📌), and deletion (🗑️).
+- **Markdown Toolbar**: Edit-mode buttons for bold, italic, strikethrough, link, heading, quote, code, bullet list, and checklist — operating on the selection (or cursor spot) in one undo step.
+- **Editable Checklists**: Task markers toggle by clicking them in the editor as well as the preview; Enter on a task, bullet, or numbered item continues it (numbered items take the next number; following lines keep theirs), Enter on an empty item removes it.
+- **Word/Character Footer**: A slim footer under the editor shows live word and character counts (hidden for locked notes).
+- **Per-Note Text Size**: Toolbar A−/A+ (or Ctrl+plus/minus) set a per-note scale; the reset button (or Ctrl+0) returns to the global size. Scales clamp to 50–300%.
+- **Tags**: Notes carry up to two free-form tags shown as `#`-prefixed pills in the footer, with a plus button revealing an inline entry to add more. Each pill carries a `×` button that removes it; pills are otherwise inert. Pill colors come from a deterministic per-tag palette. The add control hides at the cap. Tags are hidden for locked notes.
+- **Header Actions**: Quick access buttons for adding a new note (+), color theme picker, setting reminders (⏰), locking (🔒), pinning (📌), and moving to trash (🗑️).
 
 ### 3.3 System Tray & Quick Actions
 
@@ -90,6 +95,8 @@ A native, high-performance, and beautifully designed sticky notes application bu
 - **Quick Menu Actions**:
   - Spawn New Sticky Note
   - Toggle Show/Hide All Notes
+  - Notes submenu: every note, five per level with nested More… pages, so a closed note can be reopened.
+  - Trash submenu: trashed notes with Restore / Delete forever per entry, plus Empty trash. Trashed notes appear nowhere else (no windows, no reminders).
   - Dynamic Section: List of top 5 upcoming due reminders with time labels. Clicking any item opens and focuses the target note.
   - Preferences / Settings
   - Application Quit
@@ -101,6 +108,8 @@ A native, high-performance, and beautifully designed sticky notes application bu
 - **Actionable Notification Buttons**:
   - _Open Note_: Brings the corresponding sticky note to the foreground.
   - _Snooze 10m_: Reschedules the reminder.
+  - _Mark done_: Removes the fired reminder so it never fires again (for a recurring reminder this ends the whole series).
+- **Trash**: Deleting a note moves it to the trash instead — flagged in frontmatter, window closed, silent and hidden until restored or emptied. Permanent deletion happens per note or via Empty trash; git history retains the content either way.
 - **Catch-up Mechanism**: Checks for expired reminders on boot or wake from system sleep.
 
 ### 3.5 Themes & Preferences
@@ -109,6 +118,7 @@ A native, high-performance, and beautifully designed sticky notes application bu
   - _Mode A (Flexible)_: Each note maintains its own user-chosen accent color.
   - _Mode B (Uniform)_: All notes inherit a single unified theme selected in Global Settings.
 - **Dark Mode Synchronization**: Automatically adjusts contrast and text color depending on GNOME's system dark mode state.
+- **Text Size**: A global text scale (80–150% presets) applies to every note; individual notes can override it and reset back to global.
 
 ### 3.6 Advanced Desktop Features
 
@@ -185,6 +195,10 @@ workspace_id: -1
 is_pinned_to_desktop: false
 is_always_on_top: false
 is_locked: false
+tags: [work, home]               # free-form labels, may be absent
+is_trashed: false
+trashed_at: null
+font_scale: null                 # per-note text multiplier, null = global
 created_at: 2026-09-05T10:00:00Z
 updated_at: 2026-09-05T11:30:00Z
 reminders:
@@ -224,6 +238,8 @@ Machine-specific data that must never sync (illustrative):
   "auto_save_debounce_ms": 500,
   "enable_global_shortcut": false,
   "autostart": false,
+  "font_scale": 1.0,
+  "tag_colors": { "work": "blue" },
   "archive_retention_days": 30
 }
 ```
@@ -272,9 +288,8 @@ Machine-specific data that must never sync (illustrative):
 
 Candidate features recorded during design review, not yet scheduled:
 
-- Markdown render/preview toggle; checklist progress indicators
+- Checklist progress indicators
 - Embedded images (assets directory inside the note repo); note templates; note-to-note links
-- Archive / soft delete with retention
 - Natural-language due dates; GNOME Calendar integration
 - GNOME 47+ accent color synchronization; screenshot-to-note via portal
 - Importers for Xpad / KNotes / GNOME Sticky Notes
