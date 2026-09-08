@@ -5,10 +5,18 @@
 //! built-in pull/push sync. The public interface stays the same.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::error::{AppError, AppResult};
+
+/// Wall-clock budget for one git invocation. Local commands finish
+/// in milliseconds; network ones get a bounded window instead of
+/// hanging the caller — including the main loop — forever on a dead
+/// connection.
+const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Handles version control of the note repository.
 #[derive(Debug, Clone)]
@@ -132,7 +140,22 @@ fn run_git(dir: Option<&Path>, args: &[&str]) -> AppResult<()> {
     run_git_capture(dir, args).map(|_| ())
 }
 
-/// Run git and capture its stdout.
+/// Drain a child pipe on its own thread: a git command filling the
+/// pipe buffer must not deadlock the wait loop below.
+fn drain_pipe<R: Read + Send + 'static>(
+    pipe: Option<R>,
+) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+    pipe.map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    })
+}
+
+/// Run git and capture its stdout, killing the subprocess if it
+/// outlives [`GIT_TIMEOUT`].
 fn run_git_capture(dir: Option<&Path>, args: &[&str]) -> AppResult<String> {
     let mut command = Command::new("git");
     if let Some(dir) = dir {
@@ -140,10 +163,40 @@ fn run_git_capture(dir: Option<&Path>, args: &[&str]) -> AppResult<String> {
     }
     // Never block on credential prompts during a background commit.
     command.env("GIT_TERMINAL_PROMPT", "0");
-    let output = command.args(args).output().map_err(AppError::Io)?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::Git(stderr.trim().to_owned()));
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.args(args).spawn().map_err(AppError::Io)?;
+    let stdout_reader = drain_pipe(child.stdout.take());
+    let stderr_reader = drain_pipe(child.stderr.take());
+    let deadline = Instant::now() + GIT_TIMEOUT;
+    let status = loop {
+        match child.try_wait().map_err(AppError::Io)? {
+            // try_wait reaps the child, so the status is used from
+            // here — a second wait() would fail with ECHILD.
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(AppError::Git("git timed out".to_owned()));
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    let out = stdout_reader
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    let err = stderr_reader
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&err).trim().to_owned();
+        // Some failures report on stdout only — never return a blank
+        // diagnostic.
+        let detail = if stderr.is_empty() {
+            String::from_utf8_lossy(&out).trim().to_owned()
+        } else {
+            stderr
+        };
+        return Err(AppError::Git(detail));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }

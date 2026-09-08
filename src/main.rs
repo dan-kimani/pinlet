@@ -42,9 +42,20 @@ fn main() -> glib::ExitCode {
         // arrived and prepend a placeholder, keeping the rest verbatim.
         let mut remote_args = args.into_iter();
         remote_args.next();
+        // A bad remote invocation exits with its proper code instead
+        // of silently opening all notes — the running app stays up
+        // either way. The message itself cannot be forwarded: this
+        // GTK stack predates the `print_literal` invocation API, and
+        // `err.print()` would land in the primary's stderr rather
+        // than the caller's terminal.
         let remote_cli =
-            cli::Cli::try_parse_from(std::iter::once("pinlet".to_owned()).chain(remote_args))
-                .unwrap_or(cli::Cli { command: None });
+            match cli::Cli::try_parse_from(std::iter::once("pinlet".to_owned()).chain(remote_args))
+            {
+                Ok(remote_cli) => remote_cli,
+                Err(err) => {
+                    return err.exit_code();
+                }
+            };
 
         // Clone the handle out of the slot first — the slot borrow
         // must end before the None arm stores into it.

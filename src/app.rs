@@ -645,7 +645,8 @@ impl App {
             .borrow()
             .window_geometry
             .get(&id.to_string())
-            .copied();
+            .copied()
+            .filter(|geometry| geometry.width > 0 && geometry.height > 0);
 
         let callbacks = NoteCallbacks {
             on_changed: Box::new({
@@ -875,6 +876,15 @@ impl App {
         if locked_path.exists()
             && let Err(err) = std::fs::remove_file(&locked_path)
         {
+            // A stale ciphertext copy stays decryptable with the old
+            // password — as security-relevant as the lock-path
+            // leftover, so fail loud the same way.
+            if let Some(window) = self.inner.windows.borrow().get(&id) {
+                window.show_error(&format!(
+                    "Note unlocked, but the locked copy could not be removed ({}). Delete it manually.",
+                    locked_path.display()
+                ));
+            }
             eprintln!("failed to remove locked file for note {id}: {err}");
         }
         let display = if title.is_empty() {
@@ -1237,6 +1247,9 @@ impl App {
                     eprintln!("failed to save reminder state for note {id}: {err}");
                 }
             }
+            // The commit must name the reminder change — without this
+            // it goes out under whatever message happened to be set.
+            *self.inner.commit_message.borrow_mut() = "Update reminders".to_owned();
             self.schedule_commit();
         }
         for (id, due, title) in fired {
@@ -1289,13 +1302,16 @@ impl App {
                         }
                         // "__closed": the notification hid without an action
                         // (timed out). Snooze briefly so it resurfaces.
-                        _ => {
+                        "__closed" => {
                             let _ = tx.send(Msg::Snooze {
                                 note: id,
                                 due,
                                 minutes: 5,
                             });
                         }
+                        // Unknown action strings: ignore rather than
+                        // resurfacing forever on a signal nobody sent.
+                        _ => {}
                     });
                 });
             }
@@ -1790,6 +1806,7 @@ mod tests {
         note_body_text_gets_its_color();
         delete_note_scenario();
         trash_keeps_its_commit_message();
+        reminder_firing_names_its_commit();
         picking_two_colors_scenario();
         pinning_scenario();
         markdown_source_roundtrip();
@@ -1994,6 +2011,31 @@ mod tests {
             app.inner.commit_message.borrow().as_str(),
             "Trash note 'trash me'",
             "the managed close must not clobber the commit message"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A fired reminder persists its state under an "Update reminders"
+    /// commit, not whatever message happened to be set before.
+    fn reminder_firing_names_its_commit() {
+        let scratch = std::env::temp_dir().join(format!("pinlet-remind-test-{}", Uuid::new_v4()));
+
+        let gtk_app = gtk4::Application::builder()
+            .application_id("org.pinlet.TestRemind")
+            .build();
+        let app = App::new_in(&gtk_app, scratch.join("pinlet")).expect("app initializes");
+        let id = app.new_note(NoteColor::Yellow, "remind me".to_owned());
+        let past = chrono::Utc::now() - chrono::Duration::minutes(5);
+        app.add_reminder(id, past, Recurrence::None);
+        pump_main_loop();
+
+        app.check_due_reminders();
+        pump_main_loop();
+        assert_eq!(
+            app.inner.commit_message.borrow().as_str(),
+            "Update reminders",
+            "fired reminders must commit under their own message"
         );
 
         let _ = std::fs::remove_dir_all(&scratch);

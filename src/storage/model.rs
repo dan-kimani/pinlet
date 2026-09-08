@@ -7,7 +7,6 @@
 use std::path::Path;
 
 use chrono::{DateTime, Datelike, Duration, Utc, Weekday};
-use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
@@ -87,23 +86,6 @@ impl NoteColor {
             Self::Charcoal => "Charcoal".to_owned(),
             Self::Custom(hex) => hex.clone(),
         }
-    }
-}
-
-impl std::str::FromStr for NoteColor {
-    type Err = std::convert::Infallible;
-
-    /// Unknown strings become `Custom` colors.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "Yellow" => Self::Yellow,
-            "Green" => Self::Green,
-            "Blue" => Self::Blue,
-            "Pink" => Self::Pink,
-            "Purple" => Self::Purple,
-            "Charcoal" => Self::Charcoal,
-            other => Self::Custom(other.to_owned()),
-        })
     }
 }
 

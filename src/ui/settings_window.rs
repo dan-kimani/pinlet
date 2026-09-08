@@ -502,7 +502,7 @@ fn color_factory() -> SignalListItemFactory {
             .and_downcast::<gtk4::StringObject>()
             .map(|object| object.string().to_string())
             .unwrap_or_default();
-        let color: NoteColor = name.parse().unwrap_or(NoteColor::Yellow);
+        let color = NoteColor::parse_validated(&name).unwrap_or_default();
         swatch.set_css_classes(&[color.css_class(), "pinlet-swatch"]);
         label.set_label(color.name());
     });
