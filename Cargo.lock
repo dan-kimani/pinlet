@@ -1941,7 +1941,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pinlet"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "ashpd",
@@ -1960,6 +1960,7 @@ dependencies = [
  "ksni",
  "libadwaita",
  "notify-rust",
+ "pango",
  "pulldown-cmark",
  "serde",
  "serde_json",

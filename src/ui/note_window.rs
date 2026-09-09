@@ -103,6 +103,10 @@ pub struct NoteWindow {
     /// Global scale the per-note override falls back to. Updated
     /// live when Preferences changes it.
     font_base: Rc<Cell<f32>>,
+    /// Global typeface, resolved from settings (empty follows the
+    /// system monospace font). Updated live when Preferences
+    /// changes it.
+    font_family: Rc<RefCell<String>>,
     /// The reset button doubles as the scale indicator ("110%").
     font_reset: Button,
     /// Tag pill colors, shadowing the settings map — updated live
@@ -122,7 +126,10 @@ pub struct NoteWindow {
 impl NoteWindow {
     /// Build a note window and wire it to the app-core callbacks.
     /// `tag_colors` seeds the pill colors from settings; `font_base`
-    /// is the global text scale the note falls back to.
+    /// is the global text scale the note falls back to, and
+    /// `font_family` the global typeface (empty follows the system
+    /// monospace font).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         app: &gtk4::Application,
         shared: Rc<SharedNote>,
@@ -131,6 +138,7 @@ impl NoteWindow {
         pin_backend: PinBackend,
         tag_colors: HashMap<String, String>,
         font_base: f32,
+        font_family: String,
     ) -> Self {
         let callbacks = Rc::new(callbacks);
         let color = shared.note.borrow().color.clone();
@@ -209,6 +217,17 @@ impl NoteWindow {
         // stale display-wide rules it installed.
         let custom_css = Rc::new(RefCell::new(None));
 
+        // Per-window text class: unique per window (a static
+        // counter) so one note's scale and typeface never restyle
+        // another's. Created before the palette so swatch picks can
+        // keep it when they restyle the window.
+        static FONT_CLASS_NEXT: AtomicU32 = AtomicU32::new(1);
+        let font_class = format!(
+            "pinlet-font-{}",
+            FONT_CLASS_NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        window.add_css_class(&font_class);
+
         // Inline color palette: a popover of swatches. Each swatch is a flat
         // Button wrapping a colored Box — the Box renders the color reliably
         // (a Button draws its own theme background over `background-color`),
@@ -237,6 +256,7 @@ impl NoteWindow {
                 let callbacks = callbacks.clone();
                 let swatch_color = swatch_color.clone();
                 let custom_css = custom_css.clone();
+                let font_class = font_class.clone();
                 swatch.connect_clicked(move |_| {
                     shared.note.borrow_mut().color = swatch_color.clone();
                     // Route through the shared helper (not a bare class
@@ -247,6 +267,7 @@ impl NoteWindow {
                         color_display(&window, x11_desktop),
                         &custom_css,
                         &swatch_color,
+                        &font_class,
                     );
                     // Clone the body and drop the borrow before calling
                     // out: on_changed writes back into `shared.body`.
@@ -567,16 +588,11 @@ impl NoteWindow {
             });
         }
 
-        // Per-window text-scale class: unique per window (a static
-        // counter) so one note's scale never restyles another's.
-        static FONT_CLASS_NEXT: AtomicU32 = AtomicU32::new(1);
-        let font_class = format!(
-            "pinlet-font-{}",
-            FONT_CLASS_NEXT.fetch_add(1, Ordering::Relaxed)
-        );
-        window.add_css_class(&font_class);
         let font_css = Rc::new(RefCell::new(None));
         let font_base = Rc::new(Cell::new(clamp_font_scale(font_base)));
+        let font_family = Rc::new(RefCell::new(crate::fonts::resolve_font_family(
+            &font_family,
+        )));
 
         // Tag pills plus an inline entry, living in the footer and
         // rebuilt when tags or their colors change. Locked notes show
@@ -855,6 +871,7 @@ impl NoteWindow {
             font_class,
             font_css,
             font_base,
+            font_family,
             font_reset,
             tag_colors,
             tagbar,
@@ -867,7 +884,13 @@ impl NoteWindow {
         this.apply_font_scale(this.effective_scale());
         // Route through the shared helper so named and custom hex colors
         // share one path (custom colors need a dynamic provider).
-        apply_color_to(&this.window, initial_display, &this.custom_css, &color);
+        apply_color_to(
+            &this.window,
+            initial_display,
+            &this.custom_css,
+            &color,
+            &this.font_class,
+        );
         this
     }
 
@@ -886,6 +909,7 @@ impl NoteWindow {
             color_display(&self.window, self.x11_desktop),
             &self.custom_css,
             color,
+            &self.font_class,
         );
     }
 
@@ -911,6 +935,7 @@ impl NoteWindow {
             &self.font_css,
             &self.font_class,
             scale,
+            &self.font_family.borrow(),
         );
         self.font_reset
             .set_label(&format!("{}%", (scale * 100.0).round() as i32));
@@ -920,6 +945,13 @@ impl NoteWindow {
     /// note's effective scale.
     pub fn set_base_scale(&self, base: f32) {
         self.font_base.set(clamp_font_scale(base));
+        self.apply_font_scale(self.effective_scale());
+    }
+
+    /// The global typeface changed: remember it (empty follows the
+    /// system monospace font) and restyle this note.
+    pub fn set_font_family(&self, family: &str) {
+        *self.font_family.borrow_mut() = crate::fonts::resolve_font_family(family);
         self.apply_font_scale(self.effective_scale());
     }
 
@@ -1023,14 +1055,19 @@ fn color_display(window: &gtk4::Window, x11_desktop: bool) -> Option<gdk::Displa
 /// (Re)style a window: set its palette class and swap the dynamic
 /// custom-color provider, removing the previous one so stale rules
 /// never pile up on the display. Malformed custom colors install no
-/// provider (the palette class alone still applies).
+/// provider (the palette class alone still applies). `set_css_classes`
+/// replaces the whole class list, so the per-window font class is
+/// restored right after — without it the size/typeface rule stops
+/// matching and the note loses both.
 fn apply_color_to(
     window: &gtk4::Window,
     display: Option<gdk::Display>,
     slot: &RefCell<Option<gtk4::CssProvider>>,
     color: &NoteColor,
+    font_class: &str,
 ) {
     window.set_css_classes(&[color.css_class()]);
+    window.add_css_class(font_class);
     let mut slot = slot.borrow_mut();
     if let Some(old) = slot.take() {
         if let Some(display) = display.as_ref() {
@@ -1200,15 +1237,32 @@ pub fn clamp_font_scale(scale: f32) -> f32 {
     }
 }
 
-/// Swap the window's text-scale provider for one rendering `scale`
-/// on its unique font class (specificity beats the shared
-/// stylesheet's body rule without touching other windows).
+/// The CSS restyling one note's text: family AND size live on the
+/// `textview` widget node, where the text layout picks them up
+/// (GTK's own `.monospace { font-family: monospace; }` rule works
+/// the same way). Size is repeated on the inner `text` node so its
+/// specified value stays in step.
+pub(crate) fn font_css_rule(class: &str, scale: f32, family: &str) -> String {
+    format!(
+        ".{class} textview.pinlet-body {{ font-family: '{}', monospace; font-size: {:.1}pt; }}\n.{class} textview.pinlet-body text {{ font-size: {:.1}pt; }}",
+        crate::fonts::css_escape_family(family),
+        14.0 * scale,
+        14.0 * scale,
+    )
+}
+
+/// Swap the window's text provider for one rendering `scale` in
+/// `family` on its unique font class (specificity beats the shared
+/// stylesheet's body rule without touching other windows). A generic
+/// `monospace` fallback keeps the rule sane when the family is
+/// later uninstalled.
 fn swap_font_provider(
     window: &gtk4::Window,
     x11_desktop: bool,
     slot: &RefCell<Option<gtk4::CssProvider>>,
     class: &str,
     scale: f32,
+    family: &str,
 ) {
     if let Some(old) = slot.borrow_mut().take() {
         if let Some(display) = color_display(window, x11_desktop) {
@@ -1216,10 +1270,7 @@ fn swap_font_provider(
         }
     }
     let provider = gtk4::CssProvider::new();
-    provider.load_from_data(&format!(
-        ".{class} textview.pinlet-body text {{ font-size: {:.1}pt; }}",
-        14.0 * scale
-    ));
+    provider.load_from_data(&font_css_rule(class, scale, family));
     if let Some(display) = color_display(window, x11_desktop) {
         gtk4::style_context_add_provider_for_display(
             &display,
@@ -1852,7 +1903,20 @@ fn first_bracket_group(line: &str) -> Option<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EnterAction, find_checkbox};
+    use super::{EnterAction, find_checkbox, font_css_rule};
+
+    /// The family must land on the `textview` widget node, where the
+    /// text layout picks it up (GTK's own `.monospace` rule works the
+    /// same way); a family declared only on the inner `text` node
+    /// never reached the rendered text.
+    #[test]
+    fn font_rule_targets_textview_node() {
+        assert_eq!(
+            font_css_rule("pinlet-font-7", 1.0, "Caveat"),
+            ".pinlet-font-7 textview.pinlet-body { font-family: 'Caveat', monospace; font-size: 14.0pt; }\n\
+             .pinlet-font-7 textview.pinlet-body text { font-size: 14.0pt; }"
+        );
+    }
 
     #[test]
     fn checkbox_found_after_bullets() {

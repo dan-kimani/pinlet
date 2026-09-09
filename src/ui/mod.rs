@@ -10,6 +10,8 @@ pub mod x11;
 #[cfg(test)]
 pub(crate) use note_window::wire_list_continuation;
 pub use note_window::{NoteCallbacks, NoteWindow, clamp_font_scale};
+#[cfg(test)]
+pub(crate) use settings_window::build_font_dropdown;
 pub use settings_window::{SettingsCallbacks, SettingsWindow};
 
 use std::cell::RefCell;

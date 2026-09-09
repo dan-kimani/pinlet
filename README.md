@@ -12,6 +12,14 @@ your notes are portable, diffable, and never locked into a proprietary format.
 
 ![Desktop pinning](images/desktop-pinning.png)
 
+### Custom fonts
+
+![Note rendered in Caveat](images/custom-fonts.png)
+
+Notes can use any installed monospace or handwriting typeface — Caveat in this example. Change it anytime from the Note font dropdown in Preferences, where every entry previews in its own style and the list is searchable.
+
+![Note font picker in Preferences](images/preferences.png)
+
 ## Features
 
 - **Markdown notes** with a live edit/preview toggle, interactive checklists,

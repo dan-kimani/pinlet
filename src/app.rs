@@ -720,6 +720,7 @@ impl App {
             self.inner.pin_backend,
             self.inner.settings.borrow().tag_colors.clone(),
             crate::ui::clamp_font_scale(self.inner.settings.borrow().font_scale),
+            self.inner.settings.borrow().font_family.clone(),
         );
         self.inner.windows.borrow_mut().insert(id, window.clone());
         window.present();
@@ -1082,6 +1083,14 @@ impl App {
         let base = crate::ui::clamp_font_scale(self.inner.settings.borrow().font_scale);
         for window in self.inner.windows.borrow().values() {
             window.set_base_scale(base);
+        }
+    }
+
+    /// Restyle every window in the newly chosen global typeface.
+    fn apply_font_family(&self) {
+        let family = self.inner.settings.borrow().font_family.clone();
+        for window in self.inner.windows.borrow().values() {
+            window.set_font_family(&family);
         }
     }
 
@@ -1488,6 +1497,13 @@ impl App {
                             this.apply_font_mode();
                         }
                     }),
+                    on_font_family: Box::new({
+                        let this = self.clone();
+                        move |value| {
+                            this.set_setting(|settings| settings.font_family = value);
+                            this.apply_font_family();
+                        }
+                    }),
                     on_enable_shortcut: Box::new({
                         let this = self.clone();
                         move |value| {
@@ -1808,9 +1824,129 @@ mod tests {
         trash_keeps_its_commit_message();
         reminder_firing_names_its_commit();
         picking_two_colors_scenario();
+        font_picker_scenario();
+        note_window_keeps_font_class_scenario();
         pinning_scenario();
         markdown_source_roundtrip();
         enter_continuation_scenario();
+    }
+
+    /// The Note-font picker through its real builder: searchable,
+    /// listing the installed choices, preselected to the system
+    /// monospace default — or to the stored family when one is set —
+    /// and reporting user picks back through the callback.
+    fn font_picker_scenario() {
+        let picked = Rc::new(RefCell::new(String::new()));
+        let callbacks = Rc::new(SettingsCallbacks {
+            on_force_global_color: Box::new(|_| {}),
+            on_default_color: Box::new(|_| {}),
+            on_sync_dark_mode: Box::new(|_| {}),
+            on_auto_save_debounce: Box::new(|_| {}),
+            on_global_font_scale: Box::new(|_| {}),
+            on_font_family: Box::new({
+                let picked = picked.clone();
+                move |name| *picked.borrow_mut() = name
+            }),
+            on_enable_shortcut: Box::new(|_| {}),
+            on_autostart: Box::new(|_| {}),
+            on_git_sync: Box::new(|_| {}),
+            on_git_remote: Box::new(|_| {}),
+            on_git_branch: Box::new(|_| {}),
+            on_git_commit_interval: Box::new(|_| {}),
+            on_git_push_interval: Box::new(|_| {}),
+            on_git_pull: Box::new(|| {}),
+            on_git_push: Box::new(|| {}),
+            on_master_password: Box::new(|_| Ok(())),
+        });
+
+        // Expected choices come from a widget-backed Pango context,
+        // the same source the picker itself uses.
+        let probe = gtk4::Label::new(None);
+        let context = probe.create_pango_context();
+        assert!(
+            !crate::fonts::monospace_families(&context).is_empty(),
+            "expected installed monospace fonts"
+        );
+        let choices = crate::fonts::note_font_choices(&context);
+
+        let dropdown = crate::ui::build_font_dropdown(&Settings::default(), &callbacks);
+        assert!(dropdown.enables_search());
+        let count = dropdown.model().map(|model| model.n_items()).unwrap_or(0);
+        assert_eq!(count, choices.len() as u32);
+        assert!(dropdown.selected() < count);
+        assert_eq!(
+            choices[dropdown.selected() as usize],
+            crate::fonts::resolve_font_family("")
+        );
+
+        // A user pick reaches the app callback with the right family.
+        // Property notify is synchronous, so no main-loop pump needed.
+        let other = (dropdown.selected() + 1) % count;
+        dropdown.set_selected(other);
+        assert_eq!(*picked.borrow(), choices[other as usize]);
+
+        let last = choices.last().expect("at least one font").clone();
+        let stored = Settings {
+            font_family: last.clone(),
+            ..Settings::default()
+        };
+        let dropdown = crate::ui::build_font_dropdown(&stored, &callbacks);
+        assert_eq!(choices[dropdown.selected() as usize], last);
+    }
+
+    /// Recoloring a note must keep its per-window font class:
+    /// `set_css_classes` replaces the whole class list, and the
+    /// size/typeface rule keys off that class — dropping it left
+    /// notes stuck on the theme font (the reported "font not
+    /// applied" bug).
+    fn note_window_keeps_font_class_scenario() {
+        let gtk_app = gtk4::Application::builder()
+            .application_id("org.pinlet.FontClassProbe")
+            .build();
+        let shared = Rc::new(SharedNote {
+            note: RefCell::new(Note::new(Uuid::new_v4(), NoteColor::Yellow)),
+            body: RefCell::new("probe".to_owned()),
+        });
+        let callbacks = NoteCallbacks {
+            on_changed: Box::new(|_| {}),
+            on_delete: Box::new(|| {}),
+            on_new: Box::new(|| {}),
+            on_close: Box::new(|| {}),
+            on_add_reminder: Box::new(|_, _| {}),
+            on_delete_reminder: Box::new(|_| {}),
+            on_geometry_changed: Box::new(|| {}),
+            on_toggle_pin: Box::new(|| {}),
+            on_lock_requested: Box::new(|| {}),
+            on_tags_changed: Box::new(|_| {}),
+            on_font_scale: Box::new(|_| {}),
+        };
+        let window = NoteWindow::new(
+            &gtk_app,
+            shared,
+            None,
+            callbacks,
+            PinBackend::None,
+            HashMap::new(),
+            1.0,
+            "DejaVu Sans Mono".to_owned(),
+        );
+
+        let has_color_and_font = |window: &NoteWindow, color_class: &str| {
+            let classes = window.window().css_classes();
+            classes.iter().any(|class| class == color_class)
+                && classes
+                    .iter()
+                    .any(|class| class.starts_with("pinlet-font-"))
+        };
+        assert!(
+            has_color_and_font(&window, NoteColor::Yellow.css_class()),
+            "fresh window keeps its color and font classes"
+        );
+        window.apply_color(&NoteColor::Blue);
+        assert!(
+            has_color_and_font(&window, NoteColor::Blue.css_class()),
+            "recolor keeps the font class so the typeface rule matches"
+        );
     }
 
     /// Enter continuation through the real buffer wiring: task,

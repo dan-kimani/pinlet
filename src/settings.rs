@@ -41,6 +41,9 @@ pub struct Settings {
     pub git_push_interval_min: u64,
     /// Global note text scale multiplier (per-note overrides possible).
     pub font_scale: f32,
+    /// Note text typeface (a Pango family name). Empty means "follow
+    /// the system's default monospace font".
+    pub font_family: String,
     /// Per-tag palette color overrides, keyed by tag name. Tags
     /// without an entry use their deterministic palette color.
     pub tag_colors: std::collections::HashMap<String, String>,
@@ -61,6 +64,7 @@ impl Default for Settings {
             git_commit_interval_min: 5,
             git_push_interval_min: 15,
             font_scale: 1.0,
+            font_family: String::new(),
             tag_colors: std::collections::HashMap::new(),
         }
     }

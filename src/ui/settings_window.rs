@@ -25,6 +25,8 @@ pub struct SettingsCallbacks {
     pub on_auto_save_debounce: Box<dyn Fn(u64)>,
     /// Global note text scale changed (per-note overrides stay).
     pub on_global_font_scale: Box<dyn Fn(f32)>,
+    /// Note typeface changed (a Pango family name).
+    pub on_font_family: Box<dyn Fn(String)>,
     /// Global capture shortcut enabled.
     pub on_enable_shortcut: Box<dyn Fn(bool)>,
     /// Start on login.
@@ -164,6 +166,8 @@ impl SettingsWindow {
             });
         }
         appearance_group.add(&font_row);
+
+        appearance_group.add(&build_font_family_row(settings, &callbacks));
         page.add(&appearance_group);
 
         let editing_group = PreferencesGroup::builder().title("Editing").build();
@@ -462,6 +466,102 @@ fn font_scale_index(scale: f32) -> u32 {
         .map_or(2, |(index, _)| index) as u32
 }
 
+/// The Note-font picker row: a real dropdown button showing the
+/// current face, opening a searchable popup of the installed
+/// monospace and handwriting faces.
+fn build_font_family_row(settings: &Settings, callbacks: &Rc<SettingsCallbacks>) -> ActionRow {
+    let row = ActionRow::builder()
+        .title("Note font")
+        .subtitle("Typeface for note text, previewed in its own style")
+        .build();
+    row.add_suffix(&build_font_dropdown(settings, callbacks));
+    row
+}
+
+/// The dropdown itself: closed it shows the current face in its
+/// own typeface; open it filters as you type, every entry
+/// previewed in its own typeface. Preselected to the resolved
+/// setting (the system monospace font until the user picks).
+pub(crate) fn build_font_dropdown(
+    settings: &Settings,
+    callbacks: &Rc<SettingsCallbacks>,
+) -> gtk4::DropDown {
+    // Search matches against each item's string, so the popup
+    // filters as you type.
+    let font_expression = gtk4::PropertyExpression::new(
+        gtk4::StringObject::static_type(),
+        None::<gtk4::Expression>,
+        "string",
+    );
+    let button_factory = font_preview_factory();
+    let list_factory = font_preview_factory();
+    let dropdown = gtk4::DropDown::builder()
+        .expression(&font_expression)
+        .factory(&button_factory)
+        .list_factory(&list_factory)
+        .enable_search(true)
+        .build();
+    // Families come from the dropdown's own Pango context: a bare
+    // `Context::new()` has no font map attached and lists nothing,
+    // which once left the picker with only the system fallback.
+    let font_names = crate::fonts::note_font_choices(&dropdown.create_pango_context());
+    dropdown.set_model(Some(&gtk4::StringList::new(
+        &font_names.iter().map(String::as_str).collect::<Vec<_>>(),
+    )));
+    dropdown.set_selected(font_index(
+        &font_names,
+        &crate::fonts::resolve_font_family(&settings.font_family),
+    ));
+    dropdown.set_valign(gtk4::Align::Center);
+    {
+        let callbacks = callbacks.clone();
+        dropdown.connect_selected_notify(move |dropdown| {
+            if let Some(name) = font_names.get(dropdown.selected() as usize) {
+                (callbacks.on_font_family)(name.clone());
+            }
+        });
+    }
+    dropdown
+}
+
+/// Index of the resolved family in the picker, falling back to the
+/// first entry (the picker always contains the system default).
+fn font_index(choices: &[String], resolved: &str) -> u32 {
+    choices
+        .iter()
+        .position(|name| name == resolved)
+        .unwrap_or(0) as u32
+}
+
+/// Factory rendering each font entry in its own typeface, so the
+/// picker previews what it picks. Pango attributes (not markup)
+/// carry the family, so names with quotes or ampersands cannot
+/// break the row.
+fn font_preview_factory() -> SignalListItemFactory {
+    let factory = SignalListItemFactory::new();
+    factory.connect_setup(|_, item| {
+        let label = Label::builder().xalign(0.0).build();
+        item.set_child(Some(&label));
+    });
+    factory.connect_bind(|_, item| {
+        let Some(label) = item.child().and_then(|w| w.downcast::<Label>().ok()) else {
+            return;
+        };
+        let name = item
+            .item()
+            .and_downcast::<gtk4::StringObject>()
+            .map(|object| object.string().to_string())
+            .unwrap_or_default();
+        label.set_text(&name);
+        let mut description = pango::FontDescription::new();
+        description.set_family(&name);
+        let attributes = pango::AttrList::new();
+        attributes.insert(pango::AttrFontDesc::new(&description));
+        label.set_attributes(Some(&attributes));
+    });
+    factory
+}
+
 /// Index of `minutes` in the sync interval presets, falling back to Off.
 fn sync_interval_index(minutes: u64) -> u32 {
     SYNC_INTERVALS_MIN
@@ -507,4 +607,11 @@ fn color_factory() -> SignalListItemFactory {
         label.set_label(color.name());
     });
     factory
+}
+
+#[cfg(test)]
+mod tests {
+    // Picker scenarios live in `app::tests::gtk_regressions`: GTK
+    // widgets must be created on the thread that initialized GTK,
+    // and that suite owns the single initializing test.
 }
