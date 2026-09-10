@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -125,6 +125,9 @@ struct AppInner {
     /// Machine-local state (git-ignored).
     local_state: RefCell<LocalState>,
     local_state_path: PathBuf,
+    /// When the app core was created: the debounced geometry path
+    /// stays quiet for a grace period after this (login settle).
+    started_at: Instant,
     /// Drain timer for the background message channel.
     msg_source: RefCell<Option<SourceId>>,
     /// Sender side of the background message channel.
@@ -146,6 +149,11 @@ const TICK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Debounce for geometry saves (spec §3.7).
 const GEOMETRY_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// How long after startup the debounced geometry path stays quiet.
+/// Covers the login settle, when the compositor configures windows
+/// through transient sizes that must never be persisted.
+const STARTUP_GEOMETRY_GRACE: Duration = Duration::from_secs(10);
 
 impl App {
     /// Load settings and state, open the note store, prepare the git
@@ -253,6 +261,7 @@ impl App {
             geometry_source: RefCell::new(None),
             local_state: RefCell::new(local_state),
             local_state_path,
+            started_at: Instant::now(),
             msg_source: RefCell::new(None),
             tx,
             tray_snapshot,
@@ -274,15 +283,23 @@ impl App {
         Ok(app)
     }
 
-    /// Open every note's window, honor the CLI quick-capture command,
-    /// install accelerators, and start the reminder tick loop.
+    /// Open the note windows, honor the CLI quick-capture command,
+    /// install accelerators, and start the reminder tick loop. In
+    /// background mode (the login autostart entry) only pinned notes
+    /// open windows — unpinned notes stay one tray click away instead
+    /// of flooding the desktop on every sign-in. A manual launch
+    /// opens everything, as documented.
     pub fn activate(&self, cli: &cli::Cli) {
+        let background = cli.background;
         let ids: Vec<Uuid> = self
             .inner
             .notes
             .borrow()
             .values()
-            .filter(|shared| !shared.note.borrow().is_trashed)
+            .filter(|shared| {
+                let note = shared.note.borrow();
+                startup_opens_window(note.is_trashed, note.is_pinned_to_desktop, background)
+            })
             .map(|shared| shared.note.borrow().id)
             .collect();
         for id in ids {
@@ -298,7 +315,7 @@ impl App {
                 self.new_note(color, text.clone().unwrap_or_default());
             }
             Some(cli::Command::Sync) => self.sync_now(),
-            _ if self.inner.notes.borrow().is_empty() => {
+            _ if self.inner.notes.borrow().is_empty() && !background => {
                 self.new_note(self.default_color(), String::new());
             }
             _ => {}
@@ -328,6 +345,11 @@ impl App {
         } else {
             self.set_sync_state(SyncState::Unconfigured);
         }
+
+        // Entries written before background mode existed launch
+        // without the flag and flood the desktop on sign-in; heal
+        // them in place while autostart stays enabled.
+        self.heal_autostart_entry();
     }
 
     /// Handle command-line arguments arriving at a running instance
@@ -346,6 +368,12 @@ impl App {
             // process does instead of silently presenting windows.
             Some(cli::Command::Where) => println!("{}", data_dir().display()),
             _ => {
+                // A background re-invocation only ensures the app is
+                // running; popping windows would reintroduce the
+                // login flood this flag exists to prevent.
+                if cli.background {
+                    return;
+                }
                 // Plain re-invocation: bring the notes forward.
                 for window in self.inner.windows.borrow().values() {
                     window.present();
@@ -1617,19 +1645,16 @@ impl App {
         }
     }
 
-    /// Write or remove the XDG autostart entry.
+    /// Write or remove the XDG autostart entry. The entry starts
+    /// Pinlet in background mode so sign-in restores pinned notes
+    /// without flooding the desktop with unpinned ones.
     fn set_autostart(&self, enabled: bool) {
         let dir = glib::user_config_dir().join("autostart");
         let path = dir.join("org.pinlet.Pinlet.desktop");
         if enabled {
             let exe = std::env::current_exe()
                 .map_or_else(|_| "pinlet".to_owned(), |path| path.display().to_string());
-            // Quote the executable: install paths may contain spaces.
-            let entry = format!(
-                "[Desktop Entry]\nType=Application\nName=Pinlet\n\
-                 Comment=Sticky notes for your desktop\nExec=\"{exe}\"\n\
-                 Terminal=false\nX-GNOME-Autostart-enabled=true\n"
-            );
+            let entry = autostart_entry(&exe);
             if let Err(err) =
                 std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, entry))
             {
@@ -1639,6 +1664,25 @@ impl App {
             && let Err(err) = std::fs::remove_file(&path)
         {
             eprintln!("failed to remove autostart entry: {err}");
+        }
+    }
+
+    /// Rewrite a stale autostart entry (one that predates background
+    /// mode) while autostart stays enabled. Missing entries are
+    /// recreated; a disabled setting is left alone.
+    fn heal_autostart_entry(&self) {
+        if !self.inner.settings.borrow().autostart {
+            return;
+        }
+        let path = glib::user_config_dir()
+            .join("autostart")
+            .join("org.pinlet.Pinlet.desktop");
+        let stale = match std::fs::read_to_string(&path) {
+            Ok(content) => !content.contains("--background"),
+            Err(_) => true,
+        };
+        if stale {
+            self.set_autostart(true);
         }
     }
 
@@ -1687,6 +1731,14 @@ impl App {
         if let Some(source) = self.inner.geometry_source.borrow_mut().take() {
             cancel_source(source);
         }
+        // Right after startup the compositor is still configuring
+        // windows (layer-shell especially), so sizes swing through
+        // transient values. Saving those would permanently squash
+        // pinned notes — stay quiet until things settle. Explicit
+        // saves (close, pin toggle, quit) still go through.
+        if self.inner.started_at.elapsed() < STARTUP_GEOMETRY_GRACE {
+            return;
+        }
         let this = self.clone();
         let source = glib::timeout_add_local_once(GEOMETRY_DEBOUNCE, move || this.save_geometry());
         *self.inner.geometry_source.borrow_mut() = Some(source);
@@ -1698,6 +1750,13 @@ impl App {
             cancel_source(source);
         }
         for (id, window) in self.inner.windows.borrow().iter() {
+            // A hidden or half-mapped window reports a transient
+            // (often condensed) size rather than its real one. Keep
+            // the stored entry instead of clobbering good geometry
+            // with it — this is the squashed-pins-on-login report.
+            if !geometry_is_recordable(window.is_visible(), window.width(), window.height()) {
+                continue;
+            }
             let (x, y) = if window.is_pinned() {
                 window.pinned_position()
             } else {
@@ -1802,6 +1861,32 @@ fn sync_state_text(state: &SyncState) -> String {
     }
 }
 
+/// Whether a note gets a window at startup. Background mode (the
+/// login autostart entry) opens pinned notes only; trashed notes
+/// never open anywhere.
+fn startup_opens_window(is_trashed: bool, is_pinned_to_desktop: bool, background: bool) -> bool {
+    !is_trashed && (!background || is_pinned_to_desktop)
+}
+
+/// Whether a measured window size may overwrite the stored
+/// geometry. Hidden windows and degenerate sizes are transient
+/// (login configure, half-mapped windows) and must keep the stored
+/// entry instead of clobbering it.
+fn geometry_is_recordable(visible: bool, width: i32, height: i32) -> bool {
+    visible && width > 0 && height > 0
+}
+
+/// Render the XDG login autostart entry. It launches in background
+/// mode so sign-in restores pinned notes without opening unpinned
+/// ones. The executable is quoted: install paths may contain spaces.
+fn autostart_entry(exe: &str) -> String {
+    format!(
+        "[Desktop Entry]\nType=Application\nName=Pinlet\n\
+         Comment=Sticky notes for your desktop\nExec=\"{exe}\" --background\n\
+         Terminal=false\nX-GNOME-Autostart-enabled=true\n"
+    )
+}
+
 /// The pinlet data directory: the XDG data dir + `pinlet`.
 pub fn data_dir() -> PathBuf {
     glib::user_data_dir().join(DATA_DIR_NAME)
@@ -1810,6 +1895,45 @@ pub fn data_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Startup window selection: a manual launch opens every
+    /// surviving note, while background (login autostart) mode opens
+    /// pinned notes only — unpinned notes stay in the tray instead
+    /// of flooding the desktop. Trashed notes never open.
+    #[test]
+    fn startup_window_selection() {
+        assert!(startup_opens_window(false, false, false));
+        assert!(startup_opens_window(false, true, false));
+        assert!(!startup_opens_window(true, false, false));
+        assert!(!startup_opens_window(true, true, false));
+
+        assert!(!startup_opens_window(false, false, true));
+        assert!(startup_opens_window(false, true, true));
+        assert!(!startup_opens_window(true, false, true));
+        assert!(!startup_opens_window(true, true, true));
+    }
+
+    /// Geometry recordability: hidden windows and degenerate sizes
+    /// are transient (login configure, half-mapped windows) and must
+    /// keep the stored entry instead of squashing pinned notes.
+    #[test]
+    fn geometry_recordability() {
+        assert!(geometry_is_recordable(true, 300, 320));
+        assert!(!geometry_is_recordable(false, 300, 320));
+        assert!(!geometry_is_recordable(true, 0, 320));
+        assert!(!geometry_is_recordable(true, 300, 0));
+        assert!(!geometry_is_recordable(true, -5, 320));
+    }
+
+    /// The login autostart entry must start in background mode so
+    /// sign-in restores pinned notes without opening unpinned ones.
+    #[test]
+    fn autostart_entry_starts_in_background() {
+        let entry = autostart_entry("/usr/bin/pinlet");
+        assert!(entry.contains("Exec=\"/usr/bin/pinlet\" --background"));
+        let entry = autostart_entry("pinlet");
+        assert!(entry.contains("Exec=\"pinlet\" --background"));
+    }
 
     /// GTK can only be initialized once per process, and glib 0.20's
     /// default main context becomes owned by the first thread that

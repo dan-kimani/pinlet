@@ -151,6 +151,15 @@ impl NoteWindow {
             geometry.map_or(60, |g| g.y),
         )));
 
+        // Restored (or default) size, re-applied after the pin setup
+        // below: initializing the layer shell can reset the builder's
+        // default size, leaving pinned notes at their condensed
+        // minimum height instead of the saved one.
+        let (init_width, init_height) = (
+            geometry.map_or(300, |g| g.width),
+            geometry.map_or(320, |g| g.height),
+        );
+
         // Desktop pinning, two mechanisms in-app:
         // - an X11 desktop-type window (works under Ubuntu's mutter,
         //   whose layer-shell protocol is compiled out);
@@ -160,8 +169,8 @@ impl NoteWindow {
         let window: gtk4::Window = if x11_desktop {
             let plain = gtk4::Window::builder()
                 .title(shared.display_title())
-                .default_width(geometry.map_or(300, |g| g.width))
-                .default_height(geometry.map_or(320, |g| g.height))
+                .default_width(init_width)
+                .default_height(init_height)
                 .build();
             if let Some(x11_display) = x11_display.as_ref() {
                 plain.set_display(x11_display);
@@ -171,8 +180,8 @@ impl NoteWindow {
             gtk4::ApplicationWindow::builder()
                 .application(app)
                 .title(shared.display_title())
-                .default_width(geometry.map_or(300, |g| g.width))
-                .default_height(geometry.map_or(320, |g| g.height))
+                .default_width(init_width)
+                .default_height(init_height)
                 .build()
                 .upcast()
         };
@@ -193,6 +202,13 @@ impl NoteWindow {
             window.set_margin(Edge::Left, left);
             window.set_margin(Edge::Top, top);
             window.set_exclusive_zone(0);
+        }
+        if pinned {
+            // Re-assert the restored size after the pin setup above:
+            // the layer-shell (and X11 desktop) initialization can
+            // drop the builder's default size, which otherwise leaves
+            // the note at its condensed minimum height on login.
+            window.set_default_size(init_width, init_height);
         }
 
         // Header bar with quick actions. Window controls (min/max/close) are
@@ -791,13 +807,32 @@ impl NoteWindow {
         window.set_child(Some(&content));
 
         // Geometry: notify the app core (debounced there) whenever
-        // the window is resized.
+        // the window is resized — but only once mapped. Allocations
+        // before the first map are transient (often zero/condensed),
+        // and reporting them would clobber the restored size, which
+        // is exactly the squashed-pins-on-login report.
+        let mapped = Rc::new(Cell::new(false));
         {
-            let callbacks = callbacks.clone();
-            let width = callbacks.clone();
-            let height = callbacks.clone();
-            window.connect_notify_local(Some("width"), move |_, _| (width.on_geometry_changed)());
-            window.connect_notify_local(Some("height"), move |_, _| (height.on_geometry_changed)());
+            let mapped = mapped.clone();
+            window.connect_map(move |_| {
+                mapped.set(true);
+            });
+        }
+        {
+            let width_cb = callbacks.clone();
+            let width_mapped = mapped.clone();
+            window.connect_notify_local(Some("width"), move |_, _| {
+                if width_mapped.get() {
+                    (width_cb.on_geometry_changed)();
+                }
+            });
+            let height_cb = callbacks.clone();
+            let height_mapped = mapped.clone();
+            window.connect_notify_local(Some("height"), move |_, _| {
+                if height_mapped.get() {
+                    (height_cb.on_geometry_changed)();
+                }
+            });
         }
 
         // Flush pending state when the window closes.

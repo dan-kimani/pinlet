@@ -203,7 +203,7 @@ impl SettingsWindow {
 
         let autostart_row = SwitchRow::builder()
             .title("Start on login")
-            .subtitle("Launch Pinlet when you sign in")
+            .subtitle("Launch Pinlet when you sign in (pinned notes only)")
             .active(settings.autostart)
             .build();
         {

@@ -35,7 +35,8 @@ jobs:
             ninja-build \
             libwayland-dev \
             wayland-protocols \
-            libgirepository1.0-dev
+            libgirepository1.0-dev \
+            xvfb
 
       # gtk4-layer-shell isn't packaged on Ubuntu 24.04 (ubuntu-latest), so
       # build it from source for the wlr-layer-shell pinning backend.
@@ -47,6 +48,13 @@ jobs:
           ninja -C build
           sudo ninja -C build install
           sudo ldconfig
+
+      # Gate the release on the test suite. The GTK regression tests
+      # need a display, so they run under Xvfb (`-a` picks a free
+      # display number on the shared runner).
+      - name: Run test suite
+        run: |
+          xvfb-run -a cargo test
 
       - name: Bump version
         run: |

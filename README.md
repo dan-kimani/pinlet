@@ -133,6 +133,7 @@ locally from source — see the
 | Command                                        | What it does                    |
 | ---------------------------------------------- | ------------------------------- |
 | `pinlet`                                       | Open all your notes             |
+| `pinlet --background`                          | Start in the tray, opening pinned notes only (used by the login autostart entry) |
 | `pinlet new "V2 patch release notes"`          | Create a note with initial text |
 | `pinlet new "PR review comments" --color blue` | Create a blue note              |
 | `pinlet where`                                 | Print the note repository path  |
